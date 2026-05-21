@@ -3,6 +3,7 @@ filesystem:
   - ./ARCHITECTURE.md
   - ./CHANGELOG.md
   - ./README.md
+  - ./SECURITY.md
   - ./Cargo.toml
   - ./shell.nix
 git:
@@ -10,6 +11,7 @@ git:
   - ./ARCHITECTURE.md
   - ./CHANGELOG.md
   - ./README.md
+  - ./SECURITY.md
   - ./Cargo.toml
   - ./Cargo.lock
   - ./.gitignore
