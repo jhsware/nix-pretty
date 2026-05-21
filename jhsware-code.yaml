@@ -11,5 +11,7 @@ git:
   - ./CHANGELOG.md
   - ./README.md
   - ./Cargo.toml
+  - ./Cargo.lock
+  - ./.gitignore
   - ./shell.nix
   
