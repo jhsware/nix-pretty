@@ -6,7 +6,7 @@ filesystem:
   - ./SECURITY.md
   - ./Cargo.toml
   - ./shell.nix
-  - ./.github/
+  - ./build.sh
 git:
   - ./src/
   - ./ARCHITECTURE.md
@@ -17,5 +17,5 @@ git:
   - ./Cargo.lock
   - ./.gitignore
   - ./shell.nix
-  - ./.github/
+  - ./build.sh
   
