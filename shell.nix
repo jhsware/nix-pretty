@@ -38,32 +38,37 @@ pkgs.mkShell {
     echo "  cargo clippy          - lint"
     echo "  cargo fmt             - format"
 
-    # Re-exec the dev shell under nix-pretty so /nix/store paths in
-    # command output collapse to `nix:`. The wrapper itself is the
-    # thing this project builds, so the `command -v` guard means this
-    # is a no-op on a fresh checkout that has not yet run `./build.sh`
-    # to install the binary.
-    #
-    # We pin NIX_PRETTY_SHELL to an absolute path from nixpkgs so the
-    # wrapper does not resolve `bash` through $PATH - that closes the
-    # PATH-hijack vector documented in SECURITY.md §4.2.
-    #
-    # The wrapped bash would normally read ~/.bashrc and reset PS1 to
-    # your everyday prompt, dropping nix-shell's `[nix-shell:...]$`
-    # prefix. We side-step that by handing it a small --rcfile that
-    # sources ~/.bashrc first and then re-applies the PS1 nix-shell
-    # already set for us.
+    # Re-exec under nix-pretty so /nix/store paths in command output
+    # collapse to `nix:`. POSIX-clean: no `printf %q`, no `mktemp -t`,
+    # no `[[ ... ]]`, no here-strings, no bash array tricks.
     if [ -z "$NIX_PRETTY_ACTIVE" ] && [ -t 1 ] && command -v nix-pretty >/dev/null 2>&1; then
-      export NIX_PRETTY_ACTIVE=1
-      export NIX_PRETTY_SHELL=${pkgs.bashInteractive}/bin/bash
+      NIX_PRETTY_ACTIVE=1
+      NIX_PRETTY_SHELL=${pkgs.bashInteractive}/bin/bash
+      # Pass nix-shell's PS1 through the environment so the rcfile that
+      # re-applies it never has to quote/escape the value.
+      NIX_PRETTY_OUTER_PS1=$PS1
+      export NIX_PRETTY_ACTIVE NIX_PRETTY_SHELL NIX_PRETTY_OUTER_PS1
 
-      _nixpretty_rc="$(mktemp -t nixpretty-rc.XXXXXX)"
-      {
-        echo '[ -f ~/.bashrc ] && . ~/.bashrc'
-        printf 'PS1=%q\n' "$PS1"
-      } > "$_nixpretty_rc"
+      # `mktemp` is not in POSIX, but the form `mktemp DIR/PREFIX.XXXXXX`
+      # is accepted by both BSD (macOS) and GNU (Linux) implementations.
+      _nixpretty_rc=$(mktemp "''${TMPDIR:-/tmp}/nixpretty-rc.XXXXXX")
 
-      exec nix-pretty -i --rcfile "$_nixpretty_rc"
+      # Single-quoted heredoc delimiter `'RCFILE'` means no expansion at
+      # write time - $NIX_PRETTY_OUTER_PS1 is written literally and the
+      # wrapped bash expands it at startup. The body is itself POSIX:
+      # `[ -f ... ]`, `.` (the source builtin), no bash-isms.
+      cat > "$_nixpretty_rc" <<'RCFILE'
+[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
+PS1=$NIX_PRETTY_OUTER_PS1
+RCFILE
+
+      # IMPORTANT: long options must come BEFORE short options on a
+      # bash command line, otherwise bash bails with `--: invalid
+      # option`. Documented in `man bash`, INVOCATION: "These options
+      # must appear on the command line before the single-character
+      # options to be recognized." So `--rcfile FILE -i`, not the
+      # other way around.
+      exec nix-pretty --rcfile "$_nixpretty_rc" -i
     fi
   '';
 }

@@ -145,27 +145,36 @@ pkgs.mkShell {
   shellHook = ''
     # ... whatever else your project already does in shellHook ...
 
-    # Re-exec the current shell under nix-pretty, but only once and only when
-    # we are attached to a terminal. We pin NIX_PRETTY_SHELL to an absolute
-    # path from nixpkgs so the wrapper does not resolve `bash` through
-    # $PATH - that closes the PATH-hijack vector documented in
+    # Re-exec the current shell under nix-pretty, but only once and only
+    # when we are attached to a terminal. We pin NIX_PRETTY_SHELL to an
+    # absolute path from nixpkgs so the wrapper does not resolve `bash`
+    # through $PATH - that closes the PATH-hijack vector documented in
     # SECURITY.md §4.2.
     #
-    # The wrapped bash would normally read ~/.bashrc and reset PS1 to your
-    # everyday prompt, dropping nix-shell's `[nix-shell:...]$' prefix.
-    # We side-step that by handing it a small --rcfile that sources
-    # ~/.bashrc first and then re-applies the PS1 nix-shell already set.
+    # POSIX-clean: no `printf %q`, no `mktemp -t`, no `[[ ... ]]`, no
+    # here-strings, no bash array tricks. Works on macOS (BSD coreutils)
+    # and Linux (GNU coreutils) alike.
     if [ -z "$NIX_PRETTY_ACTIVE" ] && [ -t 1 ] && command -v nix-pretty >/dev/null 2>&1; then
-      export NIX_PRETTY_ACTIVE=1
-      export NIX_PRETTY_SHELL=${pkgs.bashInteractive}/bin/bash
+      NIX_PRETTY_ACTIVE=1
+      NIX_PRETTY_SHELL=${pkgs.bashInteractive}/bin/bash
+      # Pass nix-shell's PS1 through the environment so the rcfile that
+      # re-applies it never has to quote/escape the value.
+      NIX_PRETTY_OUTER_PS1=$PS1
+      export NIX_PRETTY_ACTIVE NIX_PRETTY_SHELL NIX_PRETTY_OUTER_PS1
 
-      _nixpretty_rc="$(mktemp -t nixpretty-rc.XXXXXX)"
-      {
-        echo '[ -f ~/.bashrc ] && . ~/.bashrc'
-        printf 'PS1=%q\n' "$PS1"
-      } > "$_nixpretty_rc"
+      # `mktemp` is not in POSIX, but the form `mktemp DIR/PREFIX.XXXXXX`
+      # is accepted by both BSD (macOS) and GNU (Linux) implementations.
+      _nixpretty_rc=$(mktemp "''${TMPDIR:-/tmp}/nixpretty-rc.XXXXXX")
 
-      exec nix-pretty -i --rcfile "$_nixpretty_rc"
+      # Single-quoted heredoc delimiter `'RCFILE'` means no expansion at
+      # write time - $NIX_PRETTY_OUTER_PS1 is written literally and the
+      # wrapped bash expands it at startup. The body is POSIX too.
+      cat > "$_nixpretty_rc" <<'RCFILE'
+[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
+PS1=$NIX_PRETTY_OUTER_PS1
+RCFILE
+
+      exec nix-pretty --rcfile "$_nixpretty_rc" -i
     fi
   '';
 }
@@ -193,6 +202,14 @@ would read your normal `~/.bashrc` and reset `PS1` to your everyday
 prompt, which is correct but loses the visual cue that you are inside
 a nix-shell. The temp rcfile is read once at startup and is harmless
 garbage afterwards; the OS cleans it up on shell exit.
+
+The argument order `--rcfile FILE -i` (long option first, then short
+option) is deliberate. `bash` will only recognise long options that
+appear *before* any short option on the command line - swapping to
+`-i --rcfile FILE` makes bash bail with `--: invalid option`. This
+is documented in `man bash` under INVOCATION: "These options must
+appear on the command line before the single-character options to
+be recognized."
 
 If your project's `shell.nix` already has a `shellHook` for other purposes
 (GPG setup, env vars, status messages), append the nix-pretty block to the
