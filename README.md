@@ -1,10 +1,11 @@
 # terminal-wrapper-for-nix
 
 A small macOS / Linux helper, written in Rust, that wraps `bash` inside a
-nix-shell and collapses every Nix store path that scrolls past in the terminal
-down to the short, readable form `nix:`. The hash-heavy paths that Nix prints
-are noisy and distract from the actual log message. This wrapper makes them
-disappear without touching the underlying tooling.
+nix-shell and collapses every Nix store path that scrolls past in the
+terminal: the noisy hash is dropped, the human-readable package name and
+the trailing path component are kept. The hash-heavy paths that Nix prints
+distract from the actual log message; this wrapper makes them legible
+without touching the underlying tooling.
 
 The binary is called `nix-pretty`. It spawns the configured shell in a
 pseudo-terminal, forwards stdin verbatim and rewrites the shell's output on the
@@ -13,13 +14,18 @@ TUIs - keeps working because we run the shell on a real PTY.
 
 ## What gets rewritten
 
-Every Nix store path the shell emits is collapsed to `nix:` plus whatever
-trailing path component followed the package name:
+Every Nix store path the shell emits is collapsed to `nix:` plus the
+package name plus whatever trailing path component followed:
 
 ```
 before: /nix/store/3p5l9d7v3w7nq2x9jk8m5a7s8b1234567-coreutils-9.5/bin/ls
-after:  nix:/bin/ls
+after:  nix:coreutils-9.5/bin/ls
 ```
+
+The hash is dropped (it is essentially noise to a human reader), but the
+package name is kept so a `PATH` or `-L` list that contains many store
+paths remains scannable rather than collapsing to a wall of identical
+`nix:` tokens.
 
 The rewriter recognises a store path as the literal prefix `/nix/store/`,
 followed by at least 32 lowercase alphanumeric characters (the Nix hash),
@@ -44,9 +50,9 @@ surprising at first glance.
 ### Pasted or typed paths look rewritten on screen
 
 If you paste `/nix/store/<hash>-coreutils-9.5/bin/ls` at the bash prompt,
-what you see on screen is `nix:/bin/ls`. The full path is still what bash
-receives, and pressing Enter will run the real `/bin/ls`. The reason for
-the visual mismatch is how a PTY works:
+what you see on screen is `nix:coreutils-9.5/bin/ls`. The full path is
+still what bash receives, and pressing Enter will run the real `/bin/ls`.
+The reason for the visual mismatch is how a PTY works:
 
 ```
 keypress  ->  real stdin  ->  PTY master  ->  PTY slave  ->  bash
@@ -286,11 +292,12 @@ example of that pattern.
 
 ## Limitations
 
-* The collapsed `nix:` form is one-way - the hash and package name are gone
-  from the terminal. If you need to copy a full store path you can still get
-  it from the underlying tool, for example with `nix path-info` or
-  `realpath`. The rewriter only affects what the shell prints; on-disk paths
-  are untouched.
+* The collapsed `nix:<pkg>` form is one-way: the hash is dropped from the
+  display. The package name is kept (so `nix:coreutils-9.5/bin/ls` tells
+  you which package a binary came from), but if you need the *exact*
+  hash-bearing store path back, get it from the underlying tool — for
+  example with `nix path-info` or `realpath`. The rewriter only affects
+  what the shell prints; on-disk paths are untouched.
 * The pattern is hard-coded. There is no `--pattern` flag, and no escape
   hatch in the terminal stream to ask for the original path back. If you
   want the original output, run the command without the wrapper.

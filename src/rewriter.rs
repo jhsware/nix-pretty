@@ -20,8 +20,9 @@
 //! * `<rest>` is anything that follows - typically a `/`-rooted path like
 //!   `/bin/ls`. We do not consume it.
 //!
-//! The rewriter emits `nix:` for the `/nix/store/<hash>-<pkg>` segment and
-//! passes everything else through unchanged, so
+//! The rewriter emits `nix:<pkg>` for the `/nix/store/<hash>-<pkg>` segment
+//! (i.e. it discards the noisy hash but keeps the human-readable pkg name)
+//! and passes everything else through unchanged, so
 //!
 //! ```text
 //! /nix/store/3p5l9d7v3w7nq2x9jk8m5a7s8b1234567-coreutils-9.5/bin/ls
@@ -30,8 +31,13 @@
 //! becomes
 //!
 //! ```text
-//! nix:/bin/ls
+//! nix:coreutils-9.5/bin/ls
 //! ```
+//!
+//! Keeping the pkg name is what makes lists of store paths
+//! (`PATH`, `NIX_LDFLAGS`, repeated `-L`/`-I` flags) stay distinguishable
+//! after rewriting: each entry shows its package instead of all
+//! collapsing to a wall of identical `nix:`.
 //!
 //! # Why a hand-rolled state machine
 //!
@@ -63,7 +69,11 @@ use std::io::{self, Read, Write};
 /// The literal prefix that opens a candidate match.
 const PREFIX: &[u8] = b"/nix/store/";
 
-/// What we emit in place of the matched `/nix/store/<hash>-<pkg>` segment.
+/// Fixed prefix emitted in place of the matched `/nix/store/<hash>-`
+/// portion. The full replacement is this prefix followed by the matched
+/// pkg bytes (e.g. `nix:` + `coreutils-9.5` = `nix:coreutils-9.5`).
+/// Kept as a separate constant so [`PathRewriter::replacement`] can
+/// surface "the static prefix" without leaking the pkg-dependent suffix.
 const REPLACEMENT: &[u8] = b"nix:";
 
 /// Minimum number of hash characters before a `-` may close the hash. Nix
@@ -127,8 +137,9 @@ impl PathRewriter {
         PREFIX
     }
 
-    /// The replacement this rewriter emits for a successfully matched store
-    /// path segment.
+    /// The fixed prefix this rewriter emits for a successfully matched
+    /// store-path segment. The full emitted text is this prefix followed
+    /// by the matched pkg name (e.g. `nix:` + `coreutils-9.5`).
     #[inline]
     pub fn replacement() -> &'static [u8] {
         REPLACEMENT
@@ -150,7 +161,7 @@ impl PathRewriter {
     pub fn flush(&mut self, out: &mut Vec<u8>) {
         match self.state {
             State::Pkg { count } if count > 0 => {
-                self.commit(out);
+                self.commit(out, count);
             }
             _ => {
                 if !self.buffer.is_empty() {
@@ -235,7 +246,7 @@ impl PathRewriter {
                     // a clean Idle state (so e.g. a `/` after the pkg can
                     // start a new match... it won't here, but in general
                     // bytes after pkg may resume scanning).
-                    self.commit(out);
+                    self.commit(out, count);
                     self.step(b, out);
                 }
             }
@@ -257,9 +268,15 @@ impl PathRewriter {
         self.step(b, out);
     }
 
-    /// Match succeeded: emit `REPLACEMENT`, reset.
-    fn commit(&mut self, out: &mut Vec<u8>) {
+    /// Match succeeded: emit `REPLACEMENT` followed by the matched pkg
+    /// bytes, then reset. `pkg_count` is the number of bytes consumed in
+    /// the [`State::Pkg`] state, which is also the length of the pkg
+    /// suffix at the tail of `self.buffer` (the state machine guarantees
+    /// `buffer == PREFIX + hash + b'-' + pkg`).
+    fn commit(&mut self, out: &mut Vec<u8>, pkg_count: usize) {
         out.extend_from_slice(REPLACEMENT);
+        let pkg_start = self.buffer.len() - pkg_count;
+        out.extend_from_slice(&self.buffer[pkg_start..]);
         self.buffer.clear();
         self.state = State::Idle;
     }
@@ -327,7 +344,7 @@ mod tests {
     const HASH32: &[u8] = b"3p5l9d7v3w7nq2x9jk8m5a7s8b1234567";
 
     /// A representative store path. Note this is exactly what the user's
-    /// example uses; the rewriter must collapse it to `nix:/bin/ls`.
+    /// example uses; the rewriter must collapse it to `nix:coreutils-9.5/bin/ls`.
     fn example_path() -> Vec<u8> {
         let mut v = Vec::new();
         v.extend_from_slice(b"/nix/store/");
@@ -338,14 +355,16 @@ mod tests {
 
     /// Reference implementation used as the oracle: a non-streaming
     /// equivalent of the rewriter. For each position in `input` it tries to
-    /// match a full store path; on success it emits `nix:` and skips past
-    /// the matched bytes; otherwise it emits one byte and advances.
+    /// match a full store path; on success it emits `nix:` followed by the
+    /// matched pkg bytes and skips past the consumed bytes; otherwise it
+    /// emits one byte and advances.
     fn oracle(input: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(input.len());
         let mut i = 0;
         while i < input.len() {
-            if let Some(consumed) = try_match_at(&input[i..]) {
+            if let Some((consumed, pkg)) = try_match_at(&input[i..]) {
                 out.extend_from_slice(PathRewriter::replacement());
+                out.extend_from_slice(pkg);
                 i += consumed;
             } else {
                 out.push(input[i]);
@@ -355,9 +374,11 @@ mod tests {
         out
     }
 
-    /// Returns the number of bytes consumed if `s` starts with a full store
-    /// path according to the documented grammar; otherwise `None`.
-    fn try_match_at(s: &[u8]) -> Option<usize> {
+    /// Returns `Some((consumed, pkg))` if `s` starts with a full store path
+    /// according to the documented grammar — where `consumed` is the total
+    /// number of bytes the match covers and `pkg` is the sub-slice of `s`
+    /// that holds the pkg name — and `None` otherwise.
+    fn try_match_at(s: &[u8]) -> Option<(usize, &[u8])> {
         if !s.starts_with(PREFIX) {
             return None;
         }
@@ -383,7 +404,7 @@ mod tests {
         if i == pkg_start {
             return None;
         }
-        Some(i)
+        Some((i, &s[pkg_start..i]))
     }
 
     /// Feed `input` through the rewriter using the given split points and
@@ -405,17 +426,22 @@ mod tests {
     // ----- the headline example -----------------------------------------
 
     #[test]
-    fn user_example_collapses_to_nix_colon_bin_ls() {
+    fn user_example_collapses_to_nix_coreutils_bin_ls() {
         // This is the exact example from the requirements doc; if anything
         // ever drifts in the rewriter, this test is the canary.
         let input = example_path();
-        assert_eq!(PathRewriter::rewrite_all(&input), b"nix:/bin/ls");
+        assert_eq!(
+            PathRewriter::rewrite_all(&input),
+            b"nix:coreutils-9.5/bin/ls"
+        );
     }
 
     // ----- basic behaviour ----------------------------------------------
 
     #[test]
-    fn pattern_and_replacement_are_what_we_advertise() {
+    fn pattern_and_replacement_prefix_are_what_we_advertise() {
+        // `replacement()` returns the *prefix* of what is emitted. The full
+        // emitted text is this prefix followed by the matched pkg bytes.
         assert_eq!(PathRewriter::pattern(), b"/nix/store/");
         assert_eq!(PathRewriter::replacement(), b"nix:");
     }
@@ -450,7 +476,7 @@ mod tests {
         input.extend_from_slice(b"-coreutils-9.5/bin/ls");
         assert_eq!(
             PathRewriter::rewrite_all(&input),
-            b"nix:/bin/ls"
+            b"nix:coreutils-9.5/bin/ls"
         );
     }
 
@@ -461,7 +487,7 @@ mod tests {
         input.extend_from_slice(b"/nix/store/");
         input.extend_from_slice(HASH32);
         input.extend_from_slice(b"-coreutils-9.5");
-        assert_eq!(PathRewriter::rewrite_all(&input), b"nix:");
+        assert_eq!(PathRewriter::rewrite_all(&input), b"nix:coreutils-9.5");
     }
 
     #[test]
@@ -472,7 +498,7 @@ mod tests {
         input.extend_from_slice(b"-coreutils-9.5/bin/ls for details");
         assert_eq!(
             PathRewriter::rewrite_all(&input),
-            b"see nix:/bin/ls for details"
+            b"see nix:coreutils-9.5/bin/ls for details"
         );
     }
 
@@ -486,7 +512,7 @@ mod tests {
         input.extend_from_slice(b"-pkg-2/bin");
         assert_eq!(
             PathRewriter::rewrite_all(&input),
-            b"nix:/bin and nix:/bin"
+            b"nix:pkg-1/bin and nix:pkg-2/bin"
         );
     }
 
@@ -497,7 +523,7 @@ mod tests {
         input.extend_from_slice(b"/nix/store/");
         input.extend_from_slice(HASH32);
         input.extend_from_slice(b"-gtk+3-3.24.42_dev/lib");
-        assert_eq!(PathRewriter::rewrite_all(&input), b"nix:/lib");
+        assert_eq!(PathRewriter::rewrite_all(&input), b"nix:gtk+3-3.24.42_dev/lib");
     }
 
     #[test]
@@ -509,7 +535,7 @@ mod tests {
         input.extend_from_slice(b"/nix/store/");
         input.extend_from_slice(long_hash);
         input.extend_from_slice(b"-pkg/bin");
-        assert_eq!(PathRewriter::rewrite_all(&input), b"nix:/bin");
+        assert_eq!(PathRewriter::rewrite_all(&input), b"nix:pkg/bin");
     }
 
     #[test]
@@ -601,7 +627,7 @@ mod tests {
         // Nothing emitted yet: still in Pkg state waiting for terminator.
         assert!(out.is_empty());
         r.flush(&mut out);
-        assert_eq!(out, b"nix:");
+        assert_eq!(out, b"nix:pkg-1.0");
     }
 
     #[test]
@@ -619,7 +645,7 @@ mod tests {
         input.extend_from_slice(b"-pkg/bin");
         r.process(&input, &mut out);
         r.flush(&mut out);
-        assert_eq!(out, b"nix:/bin");
+        assert_eq!(out, b"nix:pkg/bin");
     }
 
     // ----- safety / bounds ----------------------------------------------
@@ -659,7 +685,7 @@ mod tests {
         input.extend_from_slice(b"\x1b[0m\n");
         assert_eq!(
             PathRewriter::rewrite_all(&input),
-            b"\x1b[32mnix:/bin\x1b[0m\n"
+            b"\x1b[32mnix:pkg-1/bin\x1b[0m\n"
         );
     }
 
@@ -674,7 +700,7 @@ mod tests {
         input.extend_from_slice(b"-pkg\x1b[0mtail");
         assert_eq!(
             PathRewriter::rewrite_all(&input),
-            b"nix:\x1b[0mtail"
+            b"nix:pkg\x1b[0mtail"
         );
     }
 
@@ -689,7 +715,7 @@ mod tests {
 
         let mut want = Vec::new();
         want.extend_from_slice("smörgås ".as_bytes());
-        want.extend_from_slice(b"nix:/bin");
+        want.extend_from_slice(b"nix:pkg/bin");
         want.extend_from_slice(" krydda".as_bytes());
 
         assert_eq!(PathRewriter::rewrite_all(&input), want);
@@ -773,7 +799,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let n = pipe_through(Cursor::new(&input), &mut out).unwrap();
         assert_eq!(n as usize, input.len());
-        assert_eq!(out, b"nix:/x and nix:/y");
+        assert_eq!(out, b"nix:a/x and nix:b/y");
     }
 
     #[test]
@@ -799,7 +825,7 @@ mod tests {
         input.extend_from_slice(b"-pkg");
         let mut out: Vec<u8> = Vec::new();
         pipe_through(Cursor::new(&input), &mut out).unwrap();
-        assert_eq!(out, b"nix:");
+        assert_eq!(out, b"nix:pkg");
     }
 
     /// A `Read` adapter that returns its input in fixed-size chunks.
@@ -883,7 +909,7 @@ mod tests {
             &mut out,
         )
         .unwrap();
-        assert_eq!(out, b"hi nix:/bin");
+        assert_eq!(out, b"hi nix:x/bin");
     }
 
     /// A `Write` that always errors. Confirms I/O errors are propagated.

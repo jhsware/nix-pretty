@@ -12,9 +12,10 @@ loop on the parent side. The parent copies bytes from the user's real
 terminal (`stdin`) into the PTY master, and copies bytes from the PTY master
 into the user's real terminal (`stdout`) after streaming them through a
 byte-level rewriter that collapses every `/nix/store/<hash>-<pkg>` segment
-to the literal string `nix:`, leaving any trailing path component (`/bin/ls`
-and similar) untouched. When the child exits, the parent restores the
-original terminal settings and propagates the child's exit code.
+to `nix:` followed by the matched pkg name (e.g. `nix:coreutils-9.5`),
+leaving any trailing path component (`/bin/ls` and similar) untouched. When
+the child exits, the parent restores the original terminal settings and
+propagates the child's exit code.
 
 ## Guiding principles
 
@@ -80,7 +81,7 @@ branches.
 ```
 src/
   lib.rs        re-exports the public API
-  rewriter.rs   pure state-machine rewriter (store-path -> `nix:`)
+  rewriter.rs   pure state-machine rewriter (store-path -> `nix:<pkg>`)
   pty.rs        Unix PTY plumbing, fork/exec, raw-mode RAII, event loop
   main.rs       argument parsing, env reading, calls into pty::run
 ```
@@ -98,10 +99,11 @@ hash      := [0-9a-z]{32,}            ; greedy, at least 32 chars
 pkg       := [A-Za-z0-9._+-]+         ; at least one pkg char
 ```
 
-When the rewriter sees a complete `storepath`, it emits `nix:` and discards
-the matched bytes. Anything else passes through verbatim. A trailing path
-component (e.g. `/bin/ls`) is not part of the match, so it survives in the
-output unchanged.
+When the rewriter sees a complete `storepath`, it emits `nix:` followed by
+the matched `pkg` bytes (e.g. `nix:coreutils-9.5`) and discards the prefix
+and hash. Anything else passes through verbatim. A trailing path component
+(e.g. `/bin/ls`) is not part of the match, so it survives in the output
+unchanged.
 
 The implementation is a hand-rolled state machine with five states:
 
@@ -122,7 +124,7 @@ Idle  --PREFIX[0]-->  Prefix(matched)
                              |          |
                    !is_pkg_char(b), count > 0
                              v
-                      commit "nix:"
+                      commit "nix:" + pkg
                              |
                              v
                     (re-process b in Idle)
@@ -130,11 +132,12 @@ Idle  --PREFIX[0]-->  Prefix(matched)
 
 While the rewriter is inside a candidate match, every consumed byte is
 appended to an internal `buffer`. A successful match calls `commit`, which
-emits `REPLACEMENT` and clears the buffer. Any failed transition (wrong byte
-for the current state, hash too short, missing dash, empty pkg) calls
-`bail`, which emits the buffer verbatim, resets to `Idle`, and re-processes
-the offending byte so that a stray `/` after a half-matched prefix can still
-start a new candidate match.
+emits `REPLACEMENT` (the literal `nix:`) followed by the matched pkg bytes
+from the tail of `buffer`, then clears the buffer. Any failed transition
+(wrong byte for the current state, hash too short, missing dash, empty
+pkg) calls `bail`, which emits the buffer verbatim, resets to `Idle`, and
+re-processes the offending byte so that a stray `/` after a half-matched
+prefix can still start a new candidate match.
 
 A hard cap (`MAX_CANDIDATE_LEN = 1024` bytes) bounds the in-flight buffer.
 Once it is hit the rewriter bails. This keeps memory use bounded under
@@ -289,9 +292,11 @@ bounded.
   write directly to `/dev/tty` go around our master fd. There is no
   cross-platform way to intercept that without LD_PRELOAD-style tricks,
   which would violate the safety priority.
-* **Round-tripping the collapsed form back to a full path.** The hash and
-  pkg name are gone once the rewriter has emitted `nix:`. If a tool needs
-  the original path it should be invoked outside the wrapper.
+* **Round-tripping the collapsed form back to a full path.** The hash is
+  gone once the rewriter has emitted `nix:<pkg>`. The pkg name is kept (so
+  the user can tell which package a line came from), but the exact
+  hash-bearing store path is not recoverable from the display. If a tool
+  needs the original path it should be invoked outside the wrapper.
 * **Configurable patterns.** The grammar is hard-coded. Making it
   configurable would add a config file or a CLI flag, both of which would
   add surface area for bugs in exchange for a feature nobody has asked for.
@@ -337,7 +342,7 @@ covers:
   that contains both a real match and a near-miss; one-byte-at-a-time
   feeding of the headline example;
 * `flush()` behaviour at end of input both in mid-match (emit buffered
-  candidate verbatim) and at the end of a complete pkg (commit `nix:`);
+  candidate verbatim) and at the end of a complete pkg (commit `nix:<pkg>`);
 * the bounded-candidate-buffer property: feeding `2 * MAX_CANDIDATE_LEN`
   hash characters never grows the in-flight buffer past the cap, and the
   bail path emits the input verbatim;
