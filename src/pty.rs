@@ -10,8 +10,6 @@
 //! that can be tested without spawning a real PTY lives in [`crate::rewriter`]
 //! instead and is covered by exhaustive unit tests there.
 
-#![cfg(unix)]
-
 use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
@@ -517,10 +515,7 @@ fn stdin_is_tty() -> bool {
 
 fn current_winsize() -> io::Result<winsize> {
     if !stdin_is_tty() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "stdin is not a terminal",
-        ));
+        return Err(io::Error::other("stdin is not a terminal"));
     }
     // SAFETY: stdin_is_tty() just confirmed STDIN_FILENO refers to a tty.
     unsafe { ioctl_get_winsize(libc::STDIN_FILENO) }
