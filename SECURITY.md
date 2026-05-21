@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Document version | 1.1.2 |
+| Document version | 1.1.3 |
 | Last updated | 2026-05-21 |
 | Status | Draft |
 | Applies to | `nix-pretty` v0.1.0 (crate `nix-pretty`, repository `terminal-wrapper-for-nix`) |
@@ -384,11 +384,14 @@ to be installed setuid.
 * **Impact.** Could be memory corruption if an invariant were broken.
 * **Mitigation.** Code-review discipline. The `nix` crate wraps the
   same syscalls in safe types where it can; the unsafe blocks here are
-  only present where `nix 0.29` does not expose a safe wrapper.
+  only present where `nix 0.29` does not expose a safe wrapper. The
+  rewriter (`src/rewriter.rs`) is structurally `unsafe`-free, enforced
+  at compile time by an inner `#![deny(unsafe_code)]` (added in
+  v1.1.3); any future PR that adds `unsafe` to the rewriter fails the
+  build.
 * **Recommendation.** Annual `cargo audit` plus a quick `unsafe` grep
-  during release reviews. Keep `rewriter.rs` `unsafe`-free as a
-  structural invariant (currently true; can be enforced with
-  `#![deny(unsafe_code)]` at the module level).
+  during release reviews. The `rewriter.rs` invariant is now
+  compiler-enforced, not just convention.
 
 ### 4.9 Information disclosure: the collapsed `nix:` form is irreversible
 
@@ -531,6 +534,8 @@ Ordered by cost / benefit.
    For example, an inner module attribute `#![deny(unsafe_code)]`.
    Cost: one line. Benefit: makes the rewriter's safety property
    compiler-enforced.
+   *Status: implemented in v1.1.3 (`#![deny(unsafe_code)]` at the top
+   of `src/rewriter.rs`).*
 5. **Bump the MSRV floor to a cargo version containing the
    CVE-2026-33056 fix.** Cost: one Cargo.toml line. Benefit: protects
    downstream rebuilds.
@@ -598,3 +603,4 @@ the PoC.
 | 1.1.0 | 2026-05-21 | Added §4 attack-vector summary table with privilege-escalation note. Added versioning metadata at the top of the document. |
 | 1.1.1 | 2026-05-21 | Marked §6.1 as implemented: ANSI pass-through policy documented in README.md "Security considerations". Updated §4.3 recommendation accordingly. |
 | 1.1.2 | 2026-05-21 | Marked §6.2 as implemented: panic hook installed in `pty::run` (`install_panic_termios_restore`) that restores termios on the `panic = "abort"` path. Updated §4.6 mitigation, §4 table row, and §5 RAII bullet. |
+| 1.1.3 | 2026-05-21 | Marked §6.4 as implemented: `#![deny(unsafe_code)]` added at the top of `src/rewriter.rs` so the rewriter's `unsafe`-free invariant is compiler-enforced. Updated §4.8 mitigation accordingly. |

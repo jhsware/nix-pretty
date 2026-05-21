@@ -142,9 +142,12 @@ adversarial input (e.g. an unbounded run of hash characters after a prefix
 that never sees its dash) and is comfortably above any real store path.
 
 The rewriter is pure: no I/O, no syscalls, no allocation per byte beyond
-the bounded buffer. All chunk-split correctness lives in `process`, and
-`flush` handles the end-of-input edge case where a complete `Pkg` candidate
-needs to be committed even though no terminator byte was seen.
+the bounded buffer, and **no `unsafe`** — the module declares
+`#![deny(unsafe_code)]` so the property is enforced by the compiler
+rather than by convention. All chunk-split correctness lives in
+`process`, and `flush` handles the end-of-input edge case where a
+complete `Pkg` candidate needs to be committed even though no
+terminator byte was seen.
 
 ## The PTY layer
 

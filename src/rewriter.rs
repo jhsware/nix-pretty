@@ -51,6 +51,13 @@
 //! This is exercised by the unit tests for every possible split point of a
 //! representative payload.
 
+// Structural safety invariant: the rewriter is pure-Rust and must never
+// contain `unsafe`. Enforcing this at compile time means a regression
+// (someone adding an `unsafe { ... }` block during a refactor) fails the
+// build instead of silently widening the rewriter's attack surface. See
+// SECURITY.md §4.8 and §6.4.
+#![deny(unsafe_code)]
+
 use std::io::{self, Read, Write};
 
 /// The literal prefix that opens a candidate match.
