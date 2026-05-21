@@ -105,7 +105,7 @@ The guard variable `NIX_PRETTY_ACTIVE` prevents an infinite re-exec loop. The
 
 ## Limitations
 
-* The wrapper rewrites the literal seven-character prefix `/nix/store`. It does
+* The wrapper rewrites the literal ten-character prefix `/nix/store`. It does
   not try to parse hashes, validate package names, or follow symlinks. That is
   by design: it keeps the implementation small, fast and impossible to fool
   with weird input.
