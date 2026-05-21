@@ -14,7 +14,7 @@
 
 use std::ffi::{CStr, CString};
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -160,7 +160,6 @@ pub fn run(command: &str, args: &[String]) -> io::Result<i32> {
         ForkResult::Child => child_after_fork(master, slave, command, args),
         ForkResult::Parent { child } => parent_after_fork(master, slave, child),
     }
-}
 }
 
 /// Code path that runs in the freshly forked child. Does not return.
@@ -461,7 +460,15 @@ mod tests {
         let after = tcgetattr(borrowed).expect("tcgetattr after drop");
         assert_eq!(after.input_flags, original.input_flags);
         assert_eq!(after.output_flags, original.output_flags);
-        assert_eq!(after.local_flags, original.local_flags);
+        // PENDIN is a transient state flag (set when the terminal driver has
+        // a partially typed line buffered). It can flip independently of our
+        // tcsetattr calls and is not part of the configuration we own, so
+        // mask it out before asserting that the restore is exact.
+        let pendin = nix::sys::termios::LocalFlags::PENDIN;
+        assert_eq!(
+            after.local_flags & !pendin,
+            original.local_flags & !pendin,
+        );
     }
 
     #[test]

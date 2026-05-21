@@ -168,12 +168,25 @@ mod tests {
 
     // ----- helpers -------------------------------------------------------
 
-    /// Reference implementation: naive str-replace, used as the oracle.
+    /// Reference implementation used as the oracle: a naive byte-level
+    /// find-and-replace that operates entirely on `&[u8]` and therefore does
+    /// not corrupt non-UTF-8 bytes. Equivalent in behaviour to the streaming
+    /// rewriter but trivially correct.
     fn oracle(input: &[u8]) -> Vec<u8> {
-        // Safe because we only check against an ASCII pattern and emit ASCII;
-        // non-UTF-8 bytes are preserved byte-for-byte either way.
-        let s = String::from_utf8_lossy(input);
-        s.replace("/nix/store", "[nix-store]").into_bytes()
+        let needle = PathRewriter::pattern();
+        let replacement = PathRewriter::replacement();
+        let mut out = Vec::with_capacity(input.len());
+        let mut i = 0;
+        while i < input.len() {
+            if input[i..].starts_with(needle) {
+                out.extend_from_slice(replacement);
+                i += needle.len();
+            } else {
+                out.push(input[i]);
+                i += 1;
+            }
+        }
+        out
     }
 
     /// Feed `input` through the rewriter using the given split points and
@@ -264,14 +277,15 @@ mod tests {
 
     #[test]
     fn near_misses_are_left_alone() {
+        // Inputs that look like the pattern but do not actually contain it
+        // as a literal substring must pass through unchanged.
         let cases: &[(&[u8], &[u8])] = &[
-            (b"/nix/storage",     b"/nix/storage"),
-            (b"/nix/storey",      b"/nix/storey"),
-            (b"/Nix/Store",       b"/Nix/Store"),     // case-sensitive
-            (b"//nix/store",      b"/[nix-store]"),   // only the right-aligned match counts
-            (b"nix/store",        b"nix/store"),      // missing leading slash
-            (b"/nix/sto",         b"/nix/sto"),
-            (b"/nix/stor",        b"/nix/stor"),
+            (b"/nix/storage",     b"/nix/storage"),    // 10th byte differs ('a' vs 'e')
+            (b"/Nix/Store",       b"/Nix/Store"),      // case-sensitive
+            (b"//nix/store",      b"/[nix-store]"),    // junk slash then real match
+            (b"nix/store",        b"nix/store"),       // missing leading slash
+            (b"/nix/sto",         b"/nix/sto"),        // proper prefix only
+            (b"/nix/stor",        b"/nix/stor"),       // proper prefix only
         ];
         for (input, want) in cases {
             assert_eq!(
@@ -281,6 +295,16 @@ mod tests {
                 input
             );
         }
+    }
+
+    #[test]
+    fn pattern_followed_by_trailing_char_still_matches() {
+        // /nix/storey contains /nix/store as a literal prefix, so the
+        // pattern must be rewritten and the trailing 'y' kept.
+        assert_eq!(
+            PathRewriter::rewrite_all(b"/nix/storey"),
+            b"[nix-store]y"
+        );
     }
 
     // ----- chunk boundary tests -----------------------------------------
