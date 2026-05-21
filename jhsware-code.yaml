@@ -1,13 +1,14 @@
 filesystem:
-  - ./src
+  - ./src/
   - ./ARCHITECTURE.md
   - ./CHANGELOG.md
   - ./README.md
   - ./SECURITY.md
   - ./Cargo.toml
   - ./shell.nix
+  - ./.github/
 git:
-  - ./src
+  - ./src/
   - ./ARCHITECTURE.md
   - ./CHANGELOG.md
   - ./README.md
@@ -16,4 +17,5 @@ git:
   - ./Cargo.lock
   - ./.gitignore
   - ./shell.nix
+  - ./.github/
   
