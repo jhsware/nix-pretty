@@ -15,7 +15,7 @@
 use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
@@ -82,13 +82,91 @@ unsafe fn ioctl_set_ctty(fd: RawFd) -> io::Result<()> {
     }
 }
 
+// --- panic hook for termios restore ---------------------------------------
+//
+// `Cargo.toml`'s release profile sets `panic = "abort"`, which means panics
+// terminate the process **without unwinding**. `Drop` impls — including
+// [`RawModeGuard`]'s — do **not** run on that path, so a panic in the parent
+// would leave the user's terminal in raw mode. The user would then have to
+// type `reset` blind to recover, which is poor UX and could mask security
+// issues (see SECURITY.md §4.6).
+//
+// To match the architecture document's promise that the terminal is restored
+// "even on panic" we install a custom panic hook the first time [`run`] is
+// called. The hook reads a small global that [`RawModeGuard::install`]
+// populates with `(fd, original_termios)` and issues a best-effort
+// `tcsetattr(TCSANOW, original)` before chaining to the previous (default)
+// hook, so the panic message still reaches stderr before the process
+// aborts. The state is cleared by [`RawModeGuard::drop`] so a panic that
+// happens *after* normal shutdown does not try to restore on a closed fd.
+
+/// Storage for the outer terminal's original termios, populated by
+/// [`RawModeGuard::install`] and cleared by [`RawModeGuard::drop`]. The
+/// panic hook installed by [`install_panic_termios_restore`] reads this
+/// to restore the terminal on an aborting panic.
+static TERMIOS_RESTORE: OnceLock<Mutex<Option<(RawFd, Termios)>>> = OnceLock::new();
+
+/// Ensures the panic hook is installed at most once per process. Calling
+/// `std::panic::set_hook` more than once would chain hooks indefinitely
+/// across repeated `run` invocations (relevant for tests and library use).
+static PANIC_HOOK_INSTALLED: Once = Once::new();
+
+/// Install the termios-restoring panic hook. Safe to call repeatedly; only
+/// the first call has effect.
+fn install_panic_termios_restore() {
+    PANIC_HOOK_INSTALLED.call_once(|| {
+        let _ = TERMIOS_RESTORE.set(Mutex::new(None));
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // Restore termios before printing the panic message: that way
+            // the message lands on a cooked-mode terminal and the user
+            // can read it without typing `reset` first.
+            restore_termios_from_state();
+            prev(info);
+        }));
+    });
+}
+
+/// Best-effort restore of the outer terminal's termios from
+/// [`TERMIOS_RESTORE`]. No-op if the hook has not been installed or the
+/// state is empty (the normal shutdown path clears it).
+///
+/// Exposed at module scope (rather than only inside the panic-hook closure)
+/// so unit tests can exercise the restore logic without triggering an
+/// actual panic.
+fn restore_termios_from_state() {
+    if let Some(state) = TERMIOS_RESTORE.get() {
+        // A poisoned mutex means a previous user of this state panicked
+        // mid-update. Recover the inner value rather than re-panicking
+        // from inside a panic hook (which would abort with the wrong
+        // message). The data is plain bytes plus an fd; reading it after
+        // a poison is sound.
+        let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((fd, ref original)) = *guard {
+            // SAFETY: `fd` is the descriptor of the user's outer terminal,
+            // owned by stdin for the lifetime of the wrapper. Borrowing it
+            // here is sound whenever the fd is still open; if it has been
+            // closed by hostile code the kernel returns EBADF and we
+            // swallow the error.
+            let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+            let _ = tcsetattr(borrowed, SetArg::TCSANOW, original);
+        }
+    }
+}
+
 // --- raw mode guard --------------------------------------------------------
 
 /// RAII guard that puts a tty into raw mode and restores the original
 /// settings on drop. This is the single source of truth for terminal state
 /// on the parent side: as long as the guard exists, the user's terminal is
-/// in raw mode; once it is dropped (including on panic), the original
-/// settings come back.
+/// in raw mode; once it is dropped (including on a normal panic that
+/// unwinds), the original settings come back.
+///
+/// On the `panic = "abort"` path used by the release profile, `Drop` does
+/// not run. The guard therefore also hands a clone of the original
+/// termios to [`TERMIOS_RESTORE`] so the panic hook installed by
+/// [`install_panic_termios_restore`] can perform the restore before the
+/// process aborts. See SECURITY.md §4.6 and §6.2.
 struct RawModeGuard {
     fd: RawFd,
     original: Termios,
@@ -103,6 +181,18 @@ impl RawModeGuard {
         let mut raw = original.clone();
         cfmakeraw(&mut raw);
         tcsetattr(borrowed, SetArg::TCSANOW, &raw)?;
+
+        // Hand a copy of the (fd, original) pair to the panic hook so it
+        // can restore the terminal even when `panic = "abort"` prevents
+        // this guard's `Drop` from running. The hook itself must already
+        // have been installed by [`install_panic_termios_restore`]; if it
+        // was not (e.g. a unit test that bypasses `run`), the populated
+        // state simply has no reader.
+        if let Some(state) = TERMIOS_RESTORE.get() {
+            let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
+            *g = Some((fd, original.clone()));
+        }
+
         Ok(Self { fd, original })
     }
 }
@@ -116,6 +206,15 @@ impl Drop for RawModeGuard {
         // still owned by the same tty in normal program flow.
         let borrowed = unsafe { BorrowedFd::borrow_raw(self.fd) };
         let _ = tcsetattr(borrowed, SetArg::TCSANOW, &self.original);
+
+        // Clear the panic-hook restore state. The terminal is back to its
+        // original mode, so the hook must not double-restore (or worse,
+        // attempt to restore on a closed fd) if a panic happens after
+        // this point.
+        if let Some(state) = TERMIOS_RESTORE.get() {
+            let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
+            *g = None;
+        }
     }
 }
 
@@ -125,6 +224,15 @@ impl Drop for RawModeGuard {
 /// through the [`PathRewriter`] to real stdout. Returns the child's exit
 /// code (or `128 + signal_number` for a signalled exit).
 pub fn run(command: &str, args: &[String]) -> io::Result<i32> {
+    // 0. Install the panic-hook termios restore. The release profile uses
+    //    `panic = "abort"`, which skips `Drop`; without this hook a panic
+    //    in the parent would leave the user's terminal in raw mode and
+    //    they would have to type `reset` blind. The hook is installed at
+    //    most once per process (subsequent calls are no-ops) and reads
+    //    the (fd, termios) pair populated by `RawModeGuard::install`.
+    //    See SECURITY.md §4.6 and §6.2.
+    install_panic_termios_restore();
+
     // 1. Determine the PTY winsize. If stdin is a real tty, mirror its
     //    current dimensions; otherwise fall back to a 24x80 default so
     //    the child still sees a sane terminal.
@@ -440,8 +548,23 @@ mod tests {
         (r.master, r.slave)
     }
 
+    /// Serialises tests that touch the global `TERMIOS_RESTORE` state, so
+    /// they cannot race when `cargo test` runs them on multiple threads.
+    /// Anything that calls `RawModeGuard::install` / `restore_termios_from_state`
+    /// must hold this lock.
+    static TERMIOS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquire the test lock, recovering from poisoning so a previous test
+    /// panic does not break every subsequent test.
+    fn lock_termios_tests() -> std::sync::MutexGuard<'static, ()> {
+        TERMIOS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn raw_mode_guard_restores_termios_on_drop() {
+        let _serial = lock_termios_tests();
         // Use the slave side of a fresh PTY pair as our "tty" so this works
         // even in CI runners with no controlling terminal.
         let (_master, slave) = fresh_pty();
@@ -529,5 +652,118 @@ mod tests {
         unsafe { libc::close(rfd) };
 
         assert_eq!(got, payload);
+    }
+
+    /// Verifies the invariant `RawModeGuard::install` populates
+    /// `TERMIOS_RESTORE` (so the panic hook would have something to
+    /// restore) and that `Drop` clears it (so a later, unrelated panic
+    /// does not try to restore on a stale or closed fd). This is the
+    /// glue that makes the `panic = "abort"` mitigation work; if either
+    /// half regresses, the SECURITY.md §4.6 mitigation silently breaks.
+    #[test]
+    fn raw_mode_guard_populates_and_clears_termios_restore() {
+        let _serial = lock_termios_tests();
+
+        // Ensure the hook (and therefore the OnceLock) is initialised
+        // exactly as `run` would have done. Safe to call repeatedly.
+        install_panic_termios_restore();
+
+        let (_master, slave) = fresh_pty();
+        let fd = slave.as_raw_fd();
+
+        // Pre-condition: state is empty.
+        {
+            let state = TERMIOS_RESTORE
+                .get()
+                .expect("install_panic_termios_restore must initialise the OnceLock");
+            let g = state.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                g.is_none(),
+                "TERMIOS_RESTORE must be empty before any RawModeGuard is installed"
+            );
+        }
+
+        {
+            let _g = RawModeGuard::install(fd).expect("install raw mode");
+            // While the guard is alive, the state must hold the fd we
+            // installed on.
+            let state = TERMIOS_RESTORE.get().expect("hook initialised");
+            let g = state.lock().unwrap_or_else(|e| e.into_inner());
+            let (saved_fd, _) = g
+                .as_ref()
+                .expect("RawModeGuard::install must populate TERMIOS_RESTORE");
+            assert_eq!(*saved_fd, fd, "saved fd must match the installed fd");
+        }
+
+        // Post-condition: Drop must clear the state. Otherwise a panic
+        // after this point would try to restore on a fd we no longer
+        // own.
+        let state = TERMIOS_RESTORE.get().expect("hook initialised");
+        let g = state.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            g.is_none(),
+            "RawModeGuard::drop must clear TERMIOS_RESTORE"
+        );
+    }
+
+    /// Verifies the panic-hook restore *logic* (not the hook
+    /// registration itself, which would require an actual panic).
+    /// Puts a tty into raw mode without going through `RawModeGuard`,
+    /// manually populates `TERMIOS_RESTORE`, calls
+    /// `restore_termios_from_state` (the function the panic hook
+    /// invokes), and asserts the tty is back to its original mode.
+    /// This is the path that protects users when `panic = "abort"`
+    /// skips `Drop`.
+    #[test]
+    fn restore_termios_from_state_actually_restores_termios() {
+        let _serial = lock_termios_tests();
+        install_panic_termios_restore();
+
+        let (_master, slave) = fresh_pty();
+        let fd = slave.as_raw_fd();
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        let original = tcgetattr(borrowed).expect("tcgetattr on slave");
+
+        // Force the tty into raw mode without using RawModeGuard, so
+        // its `Drop` cannot rescue us.
+        let mut raw = original.clone();
+        cfmakeraw(&mut raw);
+        tcsetattr(borrowed, SetArg::TCSANOW, &raw).expect("tcsetattr raw");
+
+        // Populate the restore state the same way `RawModeGuard::install`
+        // would.
+        {
+            let state = TERMIOS_RESTORE.get().expect("hook initialised");
+            *state.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some((fd, original.clone()));
+        }
+
+        // Confirm raw mode is in effect before restore.
+        let raw_now = tcgetattr(borrowed).expect("tcgetattr in raw");
+        assert_ne!(
+            raw_now.input_flags, original.input_flags,
+            "tty should be in raw mode before restore"
+        );
+
+        // Invoke the hook's restore path. After this, the tty must
+        // match the pre-raw state.
+        restore_termios_from_state();
+
+        let after = tcgetattr(borrowed).expect("tcgetattr after restore");
+        assert_eq!(
+            after.input_flags, original.input_flags,
+            "restore_termios_from_state must put the tty back into the saved mode",
+        );
+        let pendin = nix::sys::termios::LocalFlags::PENDIN;
+        assert_eq!(
+            after.local_flags & !pendin,
+            original.local_flags & !pendin,
+        );
+
+        // Clear state so the next test starts from a known good baseline.
+        {
+            let state = TERMIOS_RESTORE.get().unwrap();
+            *state.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
     }
 }

@@ -31,9 +31,13 @@ across two buffers - none of those may produce output the original shell
 would not. Second, the wrapper must restore the user's terminal to a sane
 state on every exit path, including panics and unexpected child deaths;
 otherwise an aborted run leaves the user's terminal in raw mode and they
-need to type `reset` blind. Third, the wrapper must not introduce a new
-attack surface: there is no parsing of untrusted input beyond the small
-state machine described below, no shelling out, no network I/O.
+need to type `reset` blind. This is achieved by a pair of restoration
+mechanisms — a `RawModeGuard` RAII guard for unwinding panics and clean
+shutdown, and a process-wide panic hook for the `panic = "abort"` path
+used by the release profile (see "The PTY layer" below). Third, the
+wrapper must not introduce a new attack surface: there is no parsing of
+untrusted input beyond the small state machine described below, no
+shelling out, no network I/O.
 
 These constraints push us towards a tiny, well-typed core with most of the
 logic in pure-Rust functions that can be tested deterministically.
@@ -58,7 +62,10 @@ byte scanner with no per-byte allocation and no regex engine.
 The whole project compiles to a single statically-linkable Rust binary. We
 deliberately avoid native C build steps, plugin systems or per-user config
 files. The release profile is tuned (`lto = "thin"`, `strip = "symbols"`,
-`codegen-units = 1`, `panic = "abort"`) for a small binary.
+`codegen-units = 1`, `panic = "abort"`) for a small binary. Because
+`panic = "abort"` skips `Drop`, the parent installs a panic hook on entry
+to `pty::run` so the terminal still gets restored to its pre-raw mode
+before the process aborts; see "The PTY layer" for the details.
 
 ### Maintainability
 
@@ -143,13 +150,22 @@ needs to be committed even though no terminator byte was seen.
 
 On Unix the parent process:
 
+0. Installs a process-wide panic hook
+   (`install_panic_termios_restore`). The hook reads a small
+   `OnceLock<Mutex<Option<(RawFd, Termios)>>>` populated in step 3 below
+   and issues a best-effort `tcsetattr(TCSANOW, &original)` on the outer
+   tty before chaining to the default hook. This is the mitigation for
+   `panic = "abort"` skipping `Drop`: without it, a panic in the parent
+   would leave the user in raw mode (see SECURITY.md §4.6).
 1. Reads the current terminal's `winsize` and `termios` from `stdin`.
 2. Calls `openpty()` (via the `nix` crate) with that `winsize`, producing a
    master / slave file-descriptor pair.
 3. Puts `stdin` into raw mode through a RAII guard
-   (`RawModeGuard`). The guard captures the original `termios` and restores
-   it from its `Drop` impl, so even a panic returns the terminal to its
-   pre-run state.
+   (`RawModeGuard`). The guard captures the original `termios` and
+   restores it from its `Drop` impl **and** publishes a copy of
+   `(fd, original)` to the panic-hook state from step 0, so the
+   terminal is restored on every documented exit path: clean exit,
+   child crash, parent crash with unwinding, parent crash with abort.
 4. `fork()`s. The child closes the master fd, becomes a session leader via
    `setsid()`, acquires the slave as its controlling terminal with the
    `TIOCSCTTY` ioctl, dups the slave to fds 0/1/2, and `execvp`s the shell.
@@ -295,10 +311,11 @@ and write-error propagation.
 
 The PTY layer is not unit-tested end-to-end. It is deliberately kept small
 enough to audit by eye, and its bytes-through-rewriter contract is exercised
-by `pipe_through` against arbitrary byte streams. The two PTY-specific
-behaviours that we can test without forking a real shell - `RawModeGuard`
-restoring termios on drop, and the winsize ioctl round-trip - have direct
-unit tests against a freshly-allocated PTY pair.
+by `pipe_through` against arbitrary byte streams. The PTY-specific
+behaviours that we can test without forking a real shell — `RawModeGuard`
+restoring termios on drop, the panic-hook restore state lifecycle, the
+panic-hook restore path itself, and the winsize ioctl round-trip — have
+direct unit tests against a freshly-allocated PTY pair.
 
 ## Failure modes and how we respond to them
 
@@ -306,7 +323,7 @@ unit tests against a freshly-allocated PTY pair.
 | --- | --- |
 | Cannot allocate a PTY | Print a clear error to stderr; exit 1. |
 | Shell binary not found | `execvp` fails in the child, which exits 127; the parent observes that exit code and propagates it. |
-| Panic in the parent | The `RawModeGuard`'s `Drop` impl restores the terminal; the panic message is printed via the default hook. |
+| Panic in the parent | A custom panic hook (`install_panic_termios_restore`) restores the outer terminal's termios from a saved `(fd, original)` pair before the default hook prints the panic message. The `RawModeGuard`'s `Drop` impl also restores on the unwinding path; both paths are covered so the terminal is sane on every documented exit. |
 | SIGWINCH arrives during shutdown | The signal thread eventually returns when the main thread exits and closes the master fd. |
 | Master read returns `EIO` | Treated as EOF; flush the rewriter buffer and exit normally. |
 | Slave closed but child still alive (long-running background process) | `waitpid()` blocks until the child actually exits, which is the correct shell-wrapper semantics. |

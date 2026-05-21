@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Document version | 1.1.1 |
+| Document version | 1.1.2 |
 | Last updated | 2026-05-21 |
 | Status | Draft |
 | Applies to | `nix-pretty` v0.1.0 (crate `nix-pretty`, repository `terminal-wrapper-for-nix`) |
@@ -186,7 +186,7 @@ threat model in §2, the current mitigation, and any residual risk.
 | 4.3 | ANSI / OSC escape-sequence pass-through | High | Medium | N/A (by design) |
 | 4.4 | TIOCSTI input injection from the child† | Low | High | Yes (`setsid` + `TIOCSCTTY`) |
 | 4.5 | Async-signal-safety between `fork()` and `execvp()` | Low | Medium | Yes (fork-before-threads) |
-| 4.6 | `panic = "abort"` defeats `RawModeGuard` restore | Low | Low | No |
+| 4.6 | `panic = "abort"` defeats `RawModeGuard` restore | Low | Low | Yes (panic hook) |
 | 4.7 | Unbounded rewriter buffer (DoS) | Low | Low | Yes (`MAX_CANDIDATE_LEN`) |
 | 4.8 | Memory unsafety in `unsafe` blocks | Low | High | Yes (audited; `nix` wrappers) |
 | 4.9 | Information disclosure: irreversible `nix:` form | High | Low | N/A (by design) |
@@ -337,15 +337,25 @@ to be installed setuid.
   exercised input, and there are no `unwrap()`s in the pump.
 * **Impact.** Usability degradation, not a security boundary breach.
   The terminal will misbehave until `reset` is typed.
-* **Mitigation.** Three options, none currently applied:
-  1. Switch `[profile.release]` to `panic = "unwind"` (small binary-size
-     cost).
-  2. Install a custom panic hook that restores termios before aborting.
-  3. Document the behaviour and accept it.
-* **Recommendation.** Add a panic hook in `pty::run` that calls
-  `tcsetattr(SetArg::TCSANOW, &original)` before re-invoking the default
-  hook. The hook can capture the original termios in an
-  `Arc<Mutex<Option<Termios>>>` populated by `RawModeGuard::install`.
+* **Mitigation (strong).** Implemented in v1.1.2: `pty::run` installs a
+  process-wide panic hook (`install_panic_termios_restore`) that issues
+  `tcsetattr(TCSANOW, &original)` on the outer tty before chaining to
+  the previous (default) hook. The original termios is captured by
+  `RawModeGuard::install` in a module-level
+  `OnceLock<Mutex<Option<(RawFd, Termios)>>>` and cleared by the same
+  guard's `Drop`, so a panic that happens after normal shutdown does
+  not try to restore on a closed fd. The hook restores **before** the
+  default hook prints the panic message, so the message lands on a
+  cooked-mode terminal that the user can read without typing `reset`
+  first. The behaviour is unit-tested by
+  `raw_mode_guard_populates_and_clears_termios_restore` (state
+  lifecycle) and `restore_termios_from_state_actually_restores_termios`
+  (the restore path itself).
+* **Residual risk.** A panic that happens **before**
+  `install_panic_termios_restore` returns (i.e. while the panic hook
+  itself is being set) would not be caught by the hook. The window is
+  a single `Once::call_once` block at the very top of `run`, before
+  any tty is touched, so the terminal cannot yet be in raw mode.
 
 ### 4.7 Unbounded rewriter buffer (DoS)
 
@@ -486,9 +496,13 @@ The design buys several defensive properties for free:
   Correctness is exercised by an oracle-based fuzz harness in
   `rewriter::tests::random_payload_round_trips_through_oracle` and by
   every-chunk-boundary tests.
-* **RAII for terminal state.** `RawModeGuard` is the only owner of the
-  raw-mode property. Termios is restored on every drop path the runtime
-  can deliver under `panic = "unwind"` (see §4.6 for the `abort` caveat).
+* **RAII + panic hook for terminal state.** `RawModeGuard` is the only
+  owner of the raw-mode property and restores termios on every drop
+  path the runtime can deliver under `panic = "unwind"`. The release
+  profile uses `panic = "abort"`, so a process-wide panic hook
+  (`install_panic_termios_restore`) reads the same `(fd, termios)` pair
+  and restores it before the default hook prints the panic message and
+  the process aborts (see §4.6).
 * **PTY isolation of the child.** `setsid` + `TIOCSCTTY` give the child
   a fresh session and a fresh controlling terminal (the slave). This
   defeats the TIOCSTI class of attack (§4.4) by construction.
@@ -508,6 +522,9 @@ Ordered by cost / benefit.
 2. **Install a panic hook that restores termios.** Eliminates the
    `panic = "abort"` discrepancy in §4.6. Cost: ~20 lines of code.
    Benefit: usability and matches the architecture document's claim.
+   *Status: implemented in v1.1.2 (`pty.rs` `install_panic_termios_restore`,
+   tested by `raw_mode_guard_populates_and_clears_termios_restore` and
+   `restore_termios_from_state_actually_restores_termios`).*
 3. **Add `cargo audit` to CI.** Cost: one CI job. Benefit: catches
    future RUSTSEC advisories in dependencies before release.
 4. **Add a structural invariant against `unsafe` in `rewriter.rs`.**
@@ -580,3 +597,4 @@ the PoC.
 | 1.0.0 | 2026-05-21 | Initial Security Architecture Document. |
 | 1.1.0 | 2026-05-21 | Added §4 attack-vector summary table with privilege-escalation note. Added versioning metadata at the top of the document. |
 | 1.1.1 | 2026-05-21 | Marked §6.1 as implemented: ANSI pass-through policy documented in README.md "Security considerations". Updated §4.3 recommendation accordingly. |
+| 1.1.2 | 2026-05-21 | Marked §6.2 as implemented: panic hook installed in `pty::run` (`install_panic_termios_restore`) that restores termios on the `panic = "abort"` path. Updated §4.6 mitigation, §4 table row, and §5 RAII bullet. |
