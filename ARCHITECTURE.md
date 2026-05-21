@@ -277,6 +277,13 @@ The `Cargo.toml` lists three runtime dependencies. Each one earns its place:
 
 There are no `[dev-dependencies]`. Tests use only `std`.
 
+Supply-chain hygiene for the small dependency set is enforced by
+`cargo audit` running in CI (`.github/workflows/audit.yml`) on every
+push to `master`, every PR, and on a daily 06:00 UTC schedule. The
+scheduled run catches new RustSec advisories even on a quiet
+repository, so a vulnerability disclosed against a pinned dep
+surfaces in CI within a day without anyone having to think about it.
+
 ## Testing strategy
 
 The rewriter has exhaustive unit tests in `src/rewriter.rs`. The matrix

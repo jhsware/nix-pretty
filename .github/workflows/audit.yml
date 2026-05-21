@@ -1,0 +1,57 @@
+# cargo audit — automated supply-chain CVE check
+#
+# Implements SECURITY.md §6.3. Runs on every push to master, every PR
+# targeting master, and once a day at 06:00 UTC so new RustSec advisories
+# are caught even when no code changes have been pushed.
+#
+# The workflow has read-only repository permissions and uses pinned
+# upstream actions (actions/checkout, actions/cache) to keep the
+# supply-chain surface of the workflow itself minimal. `cargo-audit`
+# is installed with `--locked` so its own dependency tree is
+# reproducible.
+
+name: cargo audit
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  schedule:
+    # Daily at 06:00 UTC. RustSec publishes advisories asynchronously;
+    # a scheduled run catches them even on a quiet repository.
+    - cron: '0 6 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Cache cargo registry and cargo-audit binary
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-audit
+          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-audit-
+
+      - name: Install cargo-audit (if not cached)
+        run: |
+          if ! command -v cargo-audit >/dev/null; then
+            cargo install --locked cargo-audit
+          fi
+
+      - name: Run cargo audit
+        # --deny warnings fails the build on yanked or unmaintained
+        # crates as well as outright vulnerabilities, so the check
+        # stays strict over time.
+        run: cargo audit --deny warnings

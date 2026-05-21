@@ -171,6 +171,7 @@ nix-shell
 cargo test            # full test suite, including streaming rewriter tests
 cargo clippy -- -D warnings
 cargo fmt --check
+cargo audit           # supply-chain CVE check (also runs in CI daily)
 ```
 
 The rewriter lives in `src/rewriter.rs` and has exhaustive unit tests covering
@@ -181,6 +182,10 @@ matches, UTF-8 multi-byte text, a large pseudo-random payload checked against
 a non-streaming reference oracle, and the bounded-candidate-buffer safety
 property. The PTY glue lives in `src/pty.rs` behind `#[cfg(unix)]`.
 
+Supply-chain hygiene is enforced by `cargo audit` running in CI
+(`.github/workflows/audit.yml`) on every push and PR, plus a daily
+scheduled run that catches new RustSec advisories even on a quiet
+repository.
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the design rationale.
 
 ## Licence

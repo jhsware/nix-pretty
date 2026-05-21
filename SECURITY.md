@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Document version | 1.1.4 |
+| Document version | 1.1.5 |
 | Last updated | 2026-05-21 |
 | Status | Draft |
 | Applies to | `nix-pretty` v0.1.0 (crate `nix-pretty`, repository `terminal-wrapper-for-nix`) |
@@ -192,7 +192,7 @@ threat model in §2, the current mitigation, and any residual risk.
 | 4.9 | Information disclosure: irreversible `nix:` form | High | Low | N/A (by design) |
 | 4.10 | SIGWINCH thread liveness | Low | Low | Yes (`signal-hook`) |
 | 4.11 | Stdin forwarder thread on shutdown | Low | Low | Yes (documented) |
-| 4.12 | Build-time supply-chain (CVE-2026-33056 et al.) | Low | High | No |
+| 4.12 | Build-time supply-chain (CVE-2026-33056 et al.) | Low | High | Yes (`cargo audit` in CI) |
 | 4.13 | Re-exec loop in `shellHook` | Low | Low | Yes (env-var guard in example) |
 | 4.14 | Argv pass-through to the wrapped shell | Low | Low | Yes (`CString::new` rejects NUL) |
 
@@ -446,13 +446,23 @@ to be installed setuid.
   `signal-hook` are all widely-audited). Higher for transitive deps
   in general, though the dep graph here is small.
 * **Impact.** Code execution at build time as the building user.
-* **Mitigation.** Build on a Rust toolchain ≥ 1.94.1 (which contains
-  the CVE-2026-33056 patch). The project already pins `rust-version =
-  "1.74"` as a minimum; bumping the **floor** to a version that
-  contains the cargo fix would harden builds for downstream users.
-* **Recommendation.** Add `cargo audit` to CI; pin transitive deps via
-  a committed `Cargo.lock` (this is a binary crate so `Cargo.lock`
-  should already be tracked).
+* **Mitigation.** Two layers:
+  1. **`cargo audit` in CI.** Implemented in v1.1.5: a GitHub Actions
+     workflow at `.github/workflows/audit.yml` runs `cargo audit
+     --deny warnings` on every push to `master`, every PR, and on a
+     daily 06:00 UTC schedule. The schedule catches new RustSec
+     advisories even when no code changes have been pushed. The
+     workflow has read-only repository permissions, pins
+     `actions/checkout@v4` and `actions/cache@v4`, and installs
+     `cargo-audit` with `--locked` so its own dependency tree is
+     reproducible.
+  2. **Toolchain floor.** Build on a Rust toolchain ≥ 1.94.1 (which
+     contains the CVE-2026-33056 patch). The project pins
+     `rust-version = "1.74"` as the minimum today; bumping the floor
+     to ≥ 1.94.1 is tracked as §6.5, deferred to nixpkgs 26.05.
+* **Recommendation.** Keep `Cargo.lock` committed (already done — this
+  is a binary crate). Watch the daily `cargo audit` job; treat any
+  failure as a release blocker.
 
 ### 4.13 Re-exec loop in `shellHook`
 
@@ -537,6 +547,9 @@ Ordered by cost / benefit.
    `restore_termios_from_state_actually_restores_termios`).*
 3. **Add `cargo audit` to CI.** Cost: one CI job. Benefit: catches
    future RUSTSEC advisories in dependencies before release.
+   *Status: implemented in v1.1.5 (`.github/workflows/audit.yml`,
+   triggers on push to `master`, PRs, and a daily 06:00 UTC schedule;
+   runs `cargo audit --deny warnings`).*
 4. **Add a structural invariant against `unsafe` in `rewriter.rs`.**
    For example, an inner module attribute `#![deny(unsafe_code)]`.
    Cost: one line. Benefit: makes the rewriter's safety property
@@ -617,3 +630,4 @@ the PoC.
 | 1.1.2 | 2026-05-21 | Marked §6.2 as implemented: panic hook installed in `pty::run` (`install_panic_termios_restore`) that restores termios on the `panic = "abort"` path. Updated §4.6 mitigation, §4 table row, and §5 RAII bullet. |
 | 1.1.3 | 2026-05-21 | Marked §6.4 as implemented: `#![deny(unsafe_code)]` added at the top of `src/rewriter.rs` so the rewriter's `unsafe`-free invariant is compiler-enforced. Updated §4.8 mitigation accordingly. |
 | 1.1.4 | 2026-05-21 | Marked §6.6 as implemented: README.md `shellHook` example now pins `NIX_PRETTY_SHELL` to `${pkgs.bashInteractive}/bin/bash` (an immutable `/nix/store/.../bin/bash` path) so `execvp` does not consult `$PATH`. Updated §4.2 mitigation and §4 summary table. Noted §6.5 deferral to nixpkgs 26.05. |
+| 1.1.5 | 2026-05-21 | Marked §6.3 as implemented: `cargo audit` runs in CI via `.github/workflows/audit.yml` on push, PR, and a daily schedule. Updated §4.12 mitigation (now lists `cargo audit` and the toolchain floor as two layers) and §4 summary table row 4.12. |
