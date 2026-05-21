@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Document version | 1.1.5 |
+| Document version | 1.1.6 |
 | Last updated | 2026-05-21 |
 | Status | Draft |
 | Applies to | `nix-pretty` v0.1.0 (crate `nix-pretty`, repository `terminal-wrapper-for-nix`) |
@@ -535,42 +535,58 @@ Ordered by cost / benefit.
 
 1. **Document the ANSI pass-through policy in `README.md`.** Add a short
    "Security considerations" section that states the wrapper does not
-   sanitise terminal escapes. Cost: minutes. Benefit: prevents
-   downstream consumers from treating the wrapper as a sanitiser.
-   *Status: implemented in v1.1.1 (see README.md "Security
-   considerations").*
+   sanitise terminal escapes.
+   - **Cost:** minutes.
+   - **Benefit:** prevents downstream consumers from treating the
+     wrapper as a sanitiser.
+   - **Status:** implemented in v1.1.1 (see README.md "Security
+     considerations").
 2. **Install a panic hook that restores termios.** Eliminates the
-   `panic = "abort"` discrepancy in §4.6. Cost: ~20 lines of code.
-   Benefit: usability and matches the architecture document's claim.
-   *Status: implemented in v1.1.2 (`pty.rs` `install_panic_termios_restore`,
-   tested by `raw_mode_guard_populates_and_clears_termios_restore` and
-   `restore_termios_from_state_actually_restores_termios`).*
-3. **Add `cargo audit` to CI.** Cost: one CI job. Benefit: catches
-   future RUSTSEC advisories in dependencies before release.
-   *Status: implemented in v1.1.5 (`.github/workflows/audit.yml`,
-   triggers on push to `master`, PRs, and a daily 06:00 UTC schedule;
-   runs `cargo audit --deny warnings`).*
+   `panic = "abort"` discrepancy in §4.6.
+   - **Cost:** ~20 lines of code.
+   - **Benefit:** usability and matches the architecture document's
+     claim.
+   - **Status:** implemented in v1.1.2 (`pty.rs`
+     `install_panic_termios_restore`, tested by
+     `raw_mode_guard_populates_and_clears_termios_restore` and
+     `restore_termios_from_state_actually_restores_termios`).
+3. **Add `cargo audit` to CI.**
+   - **Cost:** one CI job.
+   - **Benefit:** catches future RUSTSEC advisories in dependencies
+     before release.
+   - **Status:** implemented in v1.1.5 (`.github/workflows/audit.yml`,
+     triggers on push to `master`, PRs, and a daily 06:00 UTC
+     schedule; runs `cargo audit --deny warnings`).
 4. **Add a structural invariant against `unsafe` in `rewriter.rs`.**
    For example, an inner module attribute `#![deny(unsafe_code)]`.
-   Cost: one line. Benefit: makes the rewriter's safety property
-   compiler-enforced.
-   *Status: implemented in v1.1.3 (`#![deny(unsafe_code)]` at the top
-   of `src/rewriter.rs`).*
+   - **Cost:** one line.
+   - **Benefit:** makes the rewriter's safety property
+     compiler-enforced.
+   - **Status:** implemented in v1.1.3 (`#![deny(unsafe_code)]` at the
+     top of `src/rewriter.rs`).
 5. **Bump the MSRV floor to a cargo version containing the
-   CVE-2026-33056 fix.** Cost: one Cargo.toml line. Benefit: protects
-   downstream rebuilds.
-   *Status: deferred — waiting for nixpkgs 26.05, which is expected to
-   ship a Rust toolchain ≥ 1.94.1; the MSRV will be bumped at that
-   point so the pinned dev shell and the declared floor stay in sync.*
+   CVE-2026-33056 fix.**
+   - **Cost:** one Cargo.toml line.
+   - **Benefit:** protects downstream rebuilds.
+   - **Status:** deferred — waiting for nixpkgs 26.05, which is
+     expected to ship a Rust toolchain ≥ 1.94.1; the MSRV will be
+     bumped at that point so the pinned dev shell and the declared
+     floor stay in sync.
 6. **Recommend an absolute path for `NIX_PRETTY_SHELL` in the
-   `shellHook` example.** Reduces PATH-hijack surface (§4.2). Cost:
-   one line in the README.
-   *Status: implemented in v1.1.4 (README.md `shellHook` now sets
-   `NIX_PRETTY_SHELL=${pkgs.bashInteractive}/bin/bash`).*
+   `shellHook` example.** Reduces PATH-hijack surface (§4.2).
+   - **Cost:** one line in the README.
+   - **Benefit:** removes `$PATH` from the resolution path of the
+     default shell.
+   - **Status:** implemented in v1.1.4 (README.md `shellHook` now sets
+     `NIX_PRETTY_SHELL=${pkgs.bashInteractive}/bin/bash`).
 7. **(Optional) Integration test that spawns the binary under a real
    PTY** to assert termios restoration on every documented exit path.
-   This is already listed under "Future work" in the architecture
-   document.
+   - **Cost:** non-trivial — requires CI runners with a controlling
+     tty or a `posix_openpt`-based harness.
+   - **Benefit:** end-to-end verification that the termios-restore
+     story holds on every exit path.
+   - **Status:** open — already listed under "Future work" in the
+     architecture document.
 
 ## 7. Audit checklist for new contributors
 
@@ -630,4 +646,5 @@ the PoC.
 | 1.1.2 | 2026-05-21 | Marked §6.2 as implemented: panic hook installed in `pty::run` (`install_panic_termios_restore`) that restores termios on the `panic = "abort"` path. Updated §4.6 mitigation, §4 table row, and §5 RAII bullet. |
 | 1.1.3 | 2026-05-21 | Marked §6.4 as implemented: `#![deny(unsafe_code)]` added at the top of `src/rewriter.rs` so the rewriter's `unsafe`-free invariant is compiler-enforced. Updated §4.8 mitigation accordingly. |
 | 1.1.4 | 2026-05-21 | Marked §6.6 as implemented: README.md `shellHook` example now pins `NIX_PRETTY_SHELL` to `${pkgs.bashInteractive}/bin/bash` (an immutable `/nix/store/.../bin/bash` path) so `execvp` does not consult `$PATH`. Updated §4.2 mitigation and §4 summary table. Noted §6.5 deferral to nixpkgs 26.05. |
+| 1.1.6 | 2026-05-21 | Editorial: reformatted §6 items so Cost / Benefit / Status appear on separate indented dash-led lines. No threat-model change. |
 | 1.1.5 | 2026-05-21 | Marked §6.3 as implemented: `cargo audit` runs in CI via `.github/workflows/audit.yml` on push, PR, and a daily schedule. Updated §4.12 mitigation (now lists `cargo audit` and the toolchain floor as two layers) and §4 summary table row 4.12. |
