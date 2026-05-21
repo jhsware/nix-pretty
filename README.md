@@ -1,4 +1,4 @@
-# terminal-wrapper-for-nix
+# nix-pretty
 
 A small macOS / Linux helper, written in Rust, that wraps `bash` inside a
 nix-shell and collapses every Nix store path that scrolls past in the
