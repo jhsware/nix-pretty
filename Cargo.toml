@@ -1,0 +1,43 @@
+[package]
+name = "nix-pretty"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Wraps bash inside nix-shell and rewrites /nix/store paths in terminal output for readability."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/jhsware/terminal-wrapper-for-nix"
+keywords = ["nix", "nix-shell", "terminal", "pty", "wrapper"]
+categories = ["command-line-utilities"]
+
+# Single statically-linkable binary plus a small library for testing the
+# rewriter without spawning a real PTY.
+[lib]
+name = "nix_pretty"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nix-pretty"
+path = "src/main.rs"
+
+[dependencies]
+# `nix` gives us a safe, well-audited wrapper over the POSIX calls we need
+# (openpty, termios, ioctl, fork, waitpid, poll). It is the de-facto crate
+# for this on stable Rust.
+nix = { version = "0.29", features = ["term", "fs", "process", "signal", "poll", "ioctl"] }
+# Direct access to a couple of constants/structs (winsize, TIOCSCTTY) that
+# `nix` does not re-export ergonomically.
+libc = "0.2"
+# Async-signal-safe SIGWINCH forwarding through a self-pipe.
+signal-hook = { version = "0.3", default-features = false, features = ["iterator"] }
+
+[dev-dependencies]
+# (none - tests use std only)
+
+# Release profile is tuned for "ship a single small binary".
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
