@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Document version | 1.1.3 |
+| Document version | 1.1.4 |
 | Last updated | 2026-05-21 |
 | Status | Draft |
 | Applies to | `nix-pretty` v0.1.0 (crate `nix-pretty`, repository `terminal-wrapper-for-nix`) |
@@ -182,7 +182,7 @@ threat model in §2, the current mitigation, and any residual risk.
 | § | Attack vector | Likelihood | Impact | Mitigation implemented |
 | --- | --- | --- | --- | --- |
 | 4.1 | `NIX_PRETTY_SHELL` arbitrary-binary execution | Medium | Low | Yes (documented; no setuid) |
-| 4.2 | PATH-based `execvp` lookup of default `bash` | Low | Low | No |
+| 4.2 | PATH-based `execvp` lookup of default `bash` | Low | Low | Yes (documented absolute path) |
 | 4.3 | ANSI / OSC escape-sequence pass-through | High | Medium | N/A (by design) |
 | 4.4 | TIOCSTI input injection from the child† | Low | High | Yes (`setsid` + `TIOCSCTTY`) |
 | 4.5 | Async-signal-safety between `fork()` and `execvp()` | Low | Medium | Yes (fork-before-threads) |
@@ -239,10 +239,17 @@ to be installed setuid.
 * **Likelihood.** Low in practice — users with hostile `$PATH` entries
   have larger problems.
 * **Impact.** Low (no privilege boundary, see §4.1).
-* **Mitigation.** None at the code level. Documentation could be improved
-  by recommending an absolute path in the `shellHook` example.
-* **Recommendation.** Update the default-shell documentation to suggest
-  an absolute path for `NIX_PRETTY_SHELL` in security-sensitive setups.
+* **Mitigation.** Documented in README.md (`shellHook` example): the
+  example now sets `NIX_PRETTY_SHELL=${pkgs.bashInteractive}/bin/bash`,
+  which Nix evaluates to an immutable `/nix/store/.../bin/bash` path,
+  so `execvp` never consults `$PATH`. Users on non-Nix systems are
+  shown the equivalent absolute-path syntax (`/run/current-system/sw/bin/bash`
+  on NixOS, `/bin/bash` elsewhere) and are warned against leaving the
+  default bare `bash` when `$PATH` is untrusted. Implemented in v1.1.4.
+* **Residual risk.** A user who copies the old (pre-v1.1.4) hook into
+  a new project, or who explicitly sets `NIX_PRETTY_SHELL=bash`, still
+  goes through `$PATH`. The audit checklist (§7) flags any new code
+  that resolves a binary through `$PATH`.
 
 ### 4.3 ANSI / OSC escape-sequence pass-through
 
@@ -539,9 +546,14 @@ Ordered by cost / benefit.
 5. **Bump the MSRV floor to a cargo version containing the
    CVE-2026-33056 fix.** Cost: one Cargo.toml line. Benefit: protects
    downstream rebuilds.
+   *Status: deferred — waiting for nixpkgs 26.05, which is expected to
+   ship a Rust toolchain ≥ 1.94.1; the MSRV will be bumped at that
+   point so the pinned dev shell and the declared floor stay in sync.*
 6. **Recommend an absolute path for `NIX_PRETTY_SHELL` in the
    `shellHook` example.** Reduces PATH-hijack surface (§4.2). Cost:
    one line in the README.
+   *Status: implemented in v1.1.4 (README.md `shellHook` now sets
+   `NIX_PRETTY_SHELL=${pkgs.bashInteractive}/bin/bash`).*
 7. **(Optional) Integration test that spawns the binary under a real
    PTY** to assert termios restoration on every documented exit path.
    This is already listed under "Future work" in the architecture
@@ -604,3 +616,4 @@ the PoC.
 | 1.1.1 | 2026-05-21 | Marked §6.1 as implemented: ANSI pass-through policy documented in README.md "Security considerations". Updated §4.3 recommendation accordingly. |
 | 1.1.2 | 2026-05-21 | Marked §6.2 as implemented: panic hook installed in `pty::run` (`install_panic_termios_restore`) that restores termios on the `panic = "abort"` path. Updated §4.6 mitigation, §4 table row, and §5 RAII bullet. |
 | 1.1.3 | 2026-05-21 | Marked §6.4 as implemented: `#![deny(unsafe_code)]` added at the top of `src/rewriter.rs` so the rewriter's `unsafe`-free invariant is compiler-enforced. Updated §4.8 mitigation accordingly. |
+| 1.1.4 | 2026-05-21 | Marked §6.6 as implemented: README.md `shellHook` example now pins `NIX_PRETTY_SHELL` to `${pkgs.bashInteractive}/bin/bash` (an immutable `/nix/store/.../bin/bash` path) so `execvp` does not consult `$PATH`. Updated §4.2 mitigation and §4 summary table. Noted §6.5 deferral to nixpkgs 26.05. |

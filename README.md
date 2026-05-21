@@ -95,9 +95,13 @@ pkgs.mkShell {
 
   shellHook = ''
     # Re-exec the current shell under nix-pretty, but only once and only when
-    # we are attached to a terminal.
+    # we are attached to a terminal. We pin NIX_PRETTY_SHELL to an absolute
+    # path from nixpkgs so the wrapper does not resolve `bash` through
+    # $PATH — that closes the PATH-hijack vector documented in
+    # SECURITY.md §4.2.
     if [ -z "$NIX_PRETTY_ACTIVE" ] && [ -t 1 ] && command -v nix-pretty >/dev/null; then
       export NIX_PRETTY_ACTIVE=1
+      export NIX_PRETTY_SHELL=${pkgs.bashInteractive}/bin/bash
       exec nix-pretty
     fi
   '';
@@ -107,6 +111,15 @@ pkgs.mkShell {
 The guard variable `NIX_PRETTY_ACTIVE` prevents an infinite re-exec loop. The
 `[ -t 1 ]` check skips the wrapper when the shell is run non-interactively
 (for example by editor tooling that scrapes the environment).
+
+Pinning `NIX_PRETTY_SHELL` to `${pkgs.bashInteractive}/bin/bash` (which Nix
+evaluates to an immutable `/nix/store/.../bin/bash` path) means
+`nix-pretty` never consults `$PATH` to find the shell. If you would
+rather use a system shell, give the absolute path explicitly — for
+example `NIX_PRETTY_SHELL=/run/current-system/sw/bin/bash` on NixOS or
+`NIX_PRETTY_SHELL=/bin/bash` on a Linux system. Avoid leaving the
+default (bare `bash`) for any setup where `$PATH` could contain a
+writable directory ahead of the real `bash`'s location.
 
 ## Limitations
 
