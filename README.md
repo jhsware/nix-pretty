@@ -1,10 +1,10 @@
 # terminal-wrapper-for-nix
 
 A small macOS / Linux helper, written in Rust, that wraps `bash` inside a
-nix-shell so every `/nix/store` path that scrolls past in the terminal is
-rewritten to `[nix-store]`. The hash-heavy paths that Nix prints are noisy and
-distract from the actual log message. This wrapper makes them disappear without
-touching the underlying tooling.
+nix-shell and collapses every Nix store path that scrolls past in the terminal
+down to the short, readable form `nix:`. The hash-heavy paths that Nix prints
+are noisy and distract from the actual log message. This wrapper makes them
+disappear without touching the underlying tooling.
 
 The binary is called `nix-pretty`. It spawns the configured shell in a
 pseudo-terminal, forwards stdin verbatim and rewrites the shell's output on the
@@ -13,19 +13,24 @@ TUIs - keeps working because we run the shell on a real PTY.
 
 ## What gets rewritten
 
-Every literal occurrence of `/nix/store` in the shell's output stream is
-replaced with `[nix-store]`. The store hash and package name are preserved so
-the rewritten path is still useful for copying or pasting back into commands
-that operate on store paths.
+Every Nix store path the shell emits is collapsed to `nix:` plus whatever
+trailing path component followed the package name:
 
 ```
 before: /nix/store/3p5l9d7v3w7nq2x9jk8m5a7s8b1234567-coreutils-9.5/bin/ls
-after:  [nix-store]/3p5l9d7v3w7nq2x9jk8m5a7s8b1234567-coreutils-9.5/bin/ls
+after:  nix:/bin/ls
 ```
 
+The rewriter recognises a store path as the literal prefix `/nix/store/`,
+followed by at least 32 lowercase alphanumeric characters (the Nix hash),
+followed by `-`, followed by one or more package-name characters
+(`[A-Za-z0-9._+-]`, the alphabet every derivation in nixpkgs uses). Anything
+that does not match this grammar - including bare `/nix/store` mentions that
+are not real store paths - passes through untouched.
+
 The rewriter operates on raw bytes and is safe for streams that contain ANSI
-colour escapes, UTF-8 text, or partial reads where the literal `/nix/store`
-ends up split across two chunks.
+colour escapes, UTF-8 text, or partial reads where a store path lands across
+two chunks.
 
 ## Requirements
 
@@ -105,10 +110,14 @@ The guard variable `NIX_PRETTY_ACTIVE` prevents an infinite re-exec loop. The
 
 ## Limitations
 
-* The wrapper rewrites the literal ten-character prefix `/nix/store`. It does
-  not try to parse hashes, validate package names, or follow symlinks. That is
-  by design: it keeps the implementation small, fast and impossible to fool
-  with weird input.
+* The collapsed `nix:` form is one-way - the hash and package name are gone
+  from the terminal. If you need to copy a full store path you can still get
+  it from the underlying tool, for example with `nix path-info` or
+  `realpath`. The rewriter only affects what the shell prints; on-disk paths
+  are untouched.
+* The pattern is hard-coded. There is no `--pattern` flag, and no escape
+  hatch in the terminal stream to ask for the original path back. If you
+  want the original output, run the command without the wrapper.
 * macOS and Linux only. There is no Windows code path; PTY semantics differ
   enough that supporting it well is a separate project.
 * The wrapper allocates a single PTY pair per session. If your workflow forks
@@ -125,10 +134,12 @@ cargo fmt --check
 ```
 
 The rewriter lives in `src/rewriter.rs` and has exhaustive unit tests covering
-empty input, normal matches, multiple matches in one chunk, splits across
-arbitrary chunk boundaries, ANSI colour sequences, large random payloads and
-adversarial near-matches. The PTY glue lives in `src/pty.rs` behind
-`#[cfg(unix)]`.
+the headline example, every possible chunk-boundary split, near-misses (short
+hash, wrong separator, empty package name, case-mismatched prefix), pkg names
+with the full punctuation alphabet, ANSI colour escapes around and inside
+matches, UTF-8 multi-byte text, a large pseudo-random payload checked against
+a non-streaming reference oracle, and the bounded-candidate-buffer safety
+property. The PTY glue lives in `src/pty.rs` behind `#[cfg(unix)]`.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the design rationale.
 
