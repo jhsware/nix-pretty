@@ -1,13 +1,13 @@
 filesystem:
   - ./src
-  - ./ARCHITETURE.md
+  - ./ARCHITECTURE.md
   - ./CHANGELOG.md
   - ./README.md
   - ./Cargo.toml
   - ./shell.nix
 git:
   - ./src
-  - ./ARCHITETURE.md
+  - ./ARCHITECTURE.md
   - ./CHANGELOG.md
   - ./README.md
   - ./Cargo.toml
