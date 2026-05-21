@@ -1,0 +1,15 @@
+filesystem:
+  - ./src
+  - ./ARCHITETURE.md
+  - ./CHANGELOG.md
+  - ./README.md
+  - ./Cargo.toml
+  - ./shell.nix
+git:
+  - ./src
+  - ./ARCHITETURE.md
+  - ./CHANGELOG.md
+  - ./README.md
+  - ./Cargo.toml
+  - ./shell.nix
+  
