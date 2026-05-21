@@ -37,5 +37,33 @@ pkgs.mkShell {
     echo "  cargo test            - run the test suite"
     echo "  cargo clippy          - lint"
     echo "  cargo fmt             - format"
+
+    # Re-exec the dev shell under nix-pretty so /nix/store paths in
+    # command output collapse to `nix:`. The wrapper itself is the
+    # thing this project builds, so the `command -v` guard means this
+    # is a no-op on a fresh checkout that has not yet run `./build.sh`
+    # to install the binary.
+    #
+    # We pin NIX_PRETTY_SHELL to an absolute path from nixpkgs so the
+    # wrapper does not resolve `bash` through $PATH - that closes the
+    # PATH-hijack vector documented in SECURITY.md §4.2.
+    #
+    # The wrapped bash would normally read ~/.bashrc and reset PS1 to
+    # your everyday prompt, dropping nix-shell's `[nix-shell:...]$`
+    # prefix. We side-step that by handing it a small --rcfile that
+    # sources ~/.bashrc first and then re-applies the PS1 nix-shell
+    # already set for us.
+    if [ -z "$NIX_PRETTY_ACTIVE" ] && [ -t 1 ] && command -v nix-pretty >/dev/null 2>&1; then
+      export NIX_PRETTY_ACTIVE=1
+      export NIX_PRETTY_SHELL=${pkgs.bashInteractive}/bin/bash
+
+      _nixpretty_rc="$(mktemp -t nixpretty-rc.XXXXXX)"
+      {
+        echo '[ -f ~/.bashrc ] && . ~/.bashrc'
+        printf 'PS1=%q\n' "$PS1"
+      } > "$_nixpretty_rc"
+
+      exec nix-pretty -i --rcfile "$_nixpretty_rc"
+    fi
   '';
 }

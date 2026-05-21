@@ -143,15 +143,29 @@ pkgs.mkShell {
   # ... your packages, env vars, etc ...
 
   shellHook = ''
+    # ... whatever else your project already does in shellHook ...
+
     # Re-exec the current shell under nix-pretty, but only once and only when
     # we are attached to a terminal. We pin NIX_PRETTY_SHELL to an absolute
     # path from nixpkgs so the wrapper does not resolve `bash` through
-    # $PATH — that closes the PATH-hijack vector documented in
+    # $PATH - that closes the PATH-hijack vector documented in
     # SECURITY.md §4.2.
-    if [ -z "$NIX_PRETTY_ACTIVE" ] && [ -t 1 ] && command -v nix-pretty >/dev/null; then
+    #
+    # The wrapped bash would normally read ~/.bashrc and reset PS1 to your
+    # everyday prompt, dropping nix-shell's `[nix-shell:...]$' prefix.
+    # We side-step that by handing it a small --rcfile that sources
+    # ~/.bashrc first and then re-applies the PS1 nix-shell already set.
+    if [ -z "$NIX_PRETTY_ACTIVE" ] && [ -t 1 ] && command -v nix-pretty >/dev/null 2>&1; then
       export NIX_PRETTY_ACTIVE=1
       export NIX_PRETTY_SHELL=${pkgs.bashInteractive}/bin/bash
-      exec nix-pretty
+
+      _nixpretty_rc="$(mktemp -t nixpretty-rc.XXXXXX)"
+      {
+        echo '[ -f ~/.bashrc ] && . ~/.bashrc'
+        printf 'PS1=%q\n' "$PS1"
+      } > "$_nixpretty_rc"
+
+      exec nix-pretty -i --rcfile "$_nixpretty_rc"
     fi
   '';
 }
@@ -159,7 +173,10 @@ pkgs.mkShell {
 
 The guard variable `NIX_PRETTY_ACTIVE` prevents an infinite re-exec loop. The
 `[ -t 1 ]` check skips the wrapper when the shell is run non-interactively
-(for example by editor tooling that scrapes the environment).
+(for example by editor tooling that scrapes the environment). The
+`command -v nix-pretty` guard makes the hook a no-op when `nix-pretty` is
+not (yet) installed - useful both on fresh checkouts and on machines where
+you have not built the binary.
 
 Pinning `NIX_PRETTY_SHELL` to `${pkgs.bashInteractive}/bin/bash` (which Nix
 evaluates to an immutable `/nix/store/.../bin/bash` path) means
@@ -169,6 +186,19 @@ example `NIX_PRETTY_SHELL=/run/current-system/sw/bin/bash` on NixOS or
 `NIX_PRETTY_SHELL=/bin/bash` on a Linux system. Avoid leaving the
 default (bare `bash`) for any setup where `$PATH` could contain a
 writable directory ahead of the real `bash`'s location.
+
+The `--rcfile` dance preserves nix-shell's `[nix-shell:~/...]$` prompt
+across the exec into the wrapped bash. Without it, the wrapped bash
+would read your normal `~/.bashrc` and reset `PS1` to your everyday
+prompt, which is correct but loses the visual cue that you are inside
+a nix-shell. The temp rcfile is read once at startup and is harmless
+garbage afterwards; the OS cleans it up on shell exit.
+
+If your project's `shell.nix` already has a `shellHook` for other purposes
+(GPG setup, env vars, status messages), append the nix-pretty block to the
+existing hook rather than replacing it - `exec` transfers control and any
+lines after it are dead code. This project's own `shell.nix` is a working
+example of that pattern.
 
 ## Limitations
 
