@@ -1,123 +1,161 @@
-//! Streaming byte-level rewriter that replaces every literal `/nix/store` in
-//! its input with `[nix-store]`.
+//! Streaming byte-level rewriter that collapses every Nix store path it sees
+//! in its input to the literal string `nix:`, leaving the trailing path
+//! component (if any) intact.
 //!
-//! This module is intentionally pure: no I/O, no syscalls, no dependencies
-//! beyond `std`. Everything platform-specific lives in [`crate::pty`].
+//! # Grammar
 //!
-//! # Why a state machine, not a regex
+//! A Nix store path looks like
 //!
-//! The pattern is fixed, short and starts with `/`. A single linear scan over
-//! the input with a bounded look-back buffer is sufficient to be correct in
-//! the presence of chunk boundaries that split the pattern, and it has no
-//! per-call allocation. Pulling in a regex engine would multiply the binary
-//! size and dependency surface for no behavioural benefit.
+//! ```text
+//! /nix/store/<hash>-<pkg>[<rest>]
+//! ```
+//!
+//! where
+//!
+//! * `<hash>` is at least 32 characters drawn from `[0-9a-z]` (the alphabet
+//!   used by Nix store hashes; we accept the slightly broader full lowercase
+//!   base-36 alphabet for resilience against future format tweaks);
+//! * `<pkg>` is one or more characters from `[A-Za-z0-9._+-]` (the set Nix
+//!   uses for derivation names and versions, including dashes and dots);
+//! * `<rest>` is anything that follows - typically a `/`-rooted path like
+//!   `/bin/ls`. We do not consume it.
+//!
+//! The rewriter emits `nix:` for the `/nix/store/<hash>-<pkg>` segment and
+//! passes everything else through unchanged, so
+//!
+//! ```text
+//! /nix/store/3p5l9d7v3w7nq2x9jk8m5a7s8b1234567-coreutils-9.5/bin/ls
+//! ```
+//!
+//! becomes
+//!
+//! ```text
+//! nix:/bin/ls
+//! ```
+//!
+//! # Why a hand-rolled state machine
+//!
+//! The grammar above is regular and could be expressed with a regex, but the
+//! data flow is a long-lived byte stream that may split the candidate match
+//! across arbitrary chunks (PTY reads commonly land in the middle of a
+//! match). A small explicit state machine buffers exactly the bytes of a
+//! candidate match, commits when the match completes, and bails verbatim if
+//! the match fails. There is no regex engine and no allocation per byte;
+//! the buffered candidate is bounded by [`MAX_CANDIDATE_LEN`].
 //!
 //! # Correctness invariant
 //!
 //! For any input `xs` split into chunks `c1, c2, ..., cn`, calling
 //! `process(ci, &mut out)` in order and then `flush(&mut out)` produces the
 //! exact same `out` as a single `process(xs, &mut out)` followed by `flush`.
-//! This is exercised by the unit tests for every possible split point.
+//! This is exercised by the unit tests for every possible split point of a
+//! representative payload.
 
 use std::io::{self, Read, Write};
 
-/// The literal byte sequence we look for in the input.
-const PATTERN: &[u8] = b"/nix/store";
+/// The literal prefix that opens a candidate match.
+const PREFIX: &[u8] = b"/nix/store/";
 
-/// What we emit in its place.
-const REPLACEMENT: &[u8] = b"[nix-store]";
+/// What we emit in place of the matched `/nix/store/<hash>-<pkg>` segment.
+const REPLACEMENT: &[u8] = b"nix:";
+
+/// Minimum number of hash characters before a `-` may close the hash. Nix
+/// uses exactly 32; we accept 32 or more to tolerate any future format
+/// drift and to keep the implementation simple.
+const MIN_HASH_LEN: usize = 32;
+
+/// Hard cap on the size of the in-flight candidate buffer. A real store
+/// path is around 60-120 bytes; any candidate longer than this is, by
+/// definition, not a real store path and we bail to keep the rewriter's
+/// memory use bounded under adversarial input.
+const MAX_CANDIDATE_LEN: usize = 1024;
 
 /// Streaming rewriter. Construct once per stream, feed chunks through
-/// [`PathRewriter::process`], and call [`PathRewriter::flush`] at end of input.
-///
-/// The rewriter holds back at most `PATTERN.len() - 1` bytes between calls,
-/// so the latency it adds is bounded by 9 bytes worth of output.
-#[derive(Debug, Default, Clone)]
+/// [`PathRewriter::process`], and call [`PathRewriter::flush`] at end of
+/// input.
+#[derive(Debug, Clone)]
 pub struct PathRewriter {
-    /// Bytes that we have read but not yet emitted because they could still
-    /// turn out to be the start of `PATTERN` once more input arrives.
-    ///
-    /// Invariant: `pending.len() < PATTERN.len()` and `PATTERN.starts_with(&pending)`.
-    pending: Vec<u8>,
+    state: State,
+    /// Bytes of the in-flight candidate match. Cleared on commit (after
+    /// emitting `REPLACEMENT`) or on bail (after emitting them verbatim).
+    /// Bounded by [`MAX_CANDIDATE_LEN`] by construction.
+    buffer: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum State {
+    /// Not currently inside a candidate match.
+    Idle,
+    /// Matched 1..PREFIX.len() bytes of `/nix/store/`. The next byte must
+    /// be `PREFIX[matched]` for the prefix to keep matching.
+    Prefix { matched: usize },
+    /// Matched the full prefix, now greedily consuming hash characters.
+    /// `count` is the number of hash characters consumed so far.
+    Hash { count: usize },
+    /// Just consumed the `-` separator after a long-enough hash; the next
+    /// byte must be a valid package character.
+    WantPkg,
+    /// Consuming package characters. `count` is `>= 1`.
+    Pkg { count: usize },
+}
+
+impl Default for PathRewriter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PathRewriter {
-    /// Build a fresh rewriter with empty look-back.
+    /// Build a fresh rewriter in the idle state.
     pub fn new() -> Self {
         Self {
-            pending: Vec::with_capacity(PATTERN.len()),
+            state: State::Idle,
+            buffer: Vec::with_capacity(96),
         }
     }
 
-    /// The pattern this rewriter matches.
+    /// The literal prefix this rewriter looks for.
     #[inline]
     pub fn pattern() -> &'static [u8] {
-        PATTERN
+        PREFIX
     }
 
-    /// The replacement this rewriter emits.
+    /// The replacement this rewriter emits for a successfully matched store
+    /// path segment.
     #[inline]
     pub fn replacement() -> &'static [u8] {
         REPLACEMENT
     }
 
-    /// Feed a chunk of input. Any complete matches in `pending + input` are
-    /// rewritten; the rest is appended to `out`. A short suffix that might
-    /// still grow into a full match is held back in `self.pending` for the
-    /// next call.
-    ///
-    /// This never allocates beyond what the caller asks for in `out` and
-    /// the bounded `pending` buffer (at most `PATTERN.len() - 1` bytes).
+    /// Feed a chunk of input through the rewriter. Bytes that are part of a
+    /// completed match are emitted as `REPLACEMENT`; bytes that are part of
+    /// a failed (bailed) match are emitted verbatim; bytes that are not part
+    /// of any candidate match are emitted verbatim immediately.
     pub fn process(&mut self, input: &[u8], out: &mut Vec<u8>) {
-        // Fast path: nothing pending and nothing in input. Nothing to do.
-        if self.pending.is_empty() && input.is_empty() {
-            return;
+        for &b in input {
+            self.step(b, out);
         }
-
-        // Combine pending + input into a single working buffer. We take
-        // `pending` by value so we own a single contiguous slice; we will
-        // restore the leftover (if any) at the end.
-        let mut buf = std::mem::take(&mut self.pending);
-        buf.extend_from_slice(input);
-
-        let mut i = 0usize;
-        while i < buf.len() {
-            let remaining = &buf[i..];
-
-            if remaining.starts_with(PATTERN) {
-                // Full match. Emit replacement, skip past the match.
-                out.extend_from_slice(REPLACEMENT);
-                i += PATTERN.len();
-                continue;
-            }
-
-            // Not a full match here. Is `remaining` a *proper* prefix of the
-            // pattern that could still grow into a full match? If so, hold
-            // it back. Otherwise emit one byte and advance.
-            if remaining.len() < PATTERN.len() && PATTERN.starts_with(remaining) {
-                self.pending.extend_from_slice(remaining);
-                return;
-            }
-
-            out.push(buf[i]);
-            i += 1;
-        }
-        // Buffer fully consumed, nothing left to hold back.
     }
 
-    /// Emit any bytes that were being held back because they looked like the
-    /// start of a match but the stream ended before the match could complete.
-    ///
-    /// After this call the rewriter is empty and may be reused.
+    /// Emit any remaining buffered candidate at end of input. A candidate
+    /// that has consumed at least one package character is treated as a
+    /// completed match; everything else is emitted verbatim.
     pub fn flush(&mut self, out: &mut Vec<u8>) {
-        if !self.pending.is_empty() {
-            out.extend_from_slice(&self.pending);
-            self.pending.clear();
+        match self.state {
+            State::Pkg { count } if count > 0 => {
+                self.commit(out);
+            }
+            _ => {
+                if !self.buffer.is_empty() {
+                    out.extend_from_slice(&self.buffer);
+                    self.buffer.clear();
+                }
+                self.state = State::Idle;
+            }
         }
     }
 
-    /// Helper used by tests and by the `pipe_through` convenience function.
-    /// Returns a freshly allocated `Vec<u8>` with the input fully rewritten.
+    /// Convenience: rewrite a single byte slice in one shot.
     pub fn rewrite_all(input: &[u8]) -> Vec<u8> {
         let mut r = Self::new();
         let mut out = Vec::with_capacity(input.len());
@@ -125,6 +163,115 @@ impl PathRewriter {
         r.flush(&mut out);
         out
     }
+
+    // --- internals --------------------------------------------------------
+
+    fn step(&mut self, b: u8, out: &mut Vec<u8>) {
+        // Hard cap on the in-flight candidate. If we are growing past it
+        // without committing, this can't be a real store path; bail.
+        if self.buffer.len() >= MAX_CANDIDATE_LEN {
+            self.bail(b, out);
+            return;
+        }
+
+        match self.state {
+            State::Idle => {
+                if b == PREFIX[0] {
+                    self.state = State::Prefix { matched: 1 };
+                    self.buffer.push(b);
+                } else {
+                    out.push(b);
+                }
+            }
+            State::Prefix { matched } => {
+                if matched < PREFIX.len() && b == PREFIX[matched] {
+                    self.buffer.push(b);
+                    if matched + 1 == PREFIX.len() {
+                        self.state = State::Hash { count: 0 };
+                    } else {
+                        self.state = State::Prefix {
+                            matched: matched + 1,
+                        };
+                    }
+                } else {
+                    self.bail(b, out);
+                }
+            }
+            State::Hash { count } => {
+                if is_hash_char(b) {
+                    self.buffer.push(b);
+                    self.state = State::Hash { count: count + 1 };
+                } else if b == b'-' && count >= MIN_HASH_LEN {
+                    self.buffer.push(b);
+                    self.state = State::WantPkg;
+                } else {
+                    self.bail(b, out);
+                }
+            }
+            State::WantPkg => {
+                if is_pkg_char(b) {
+                    self.buffer.push(b);
+                    self.state = State::Pkg { count: 1 };
+                } else {
+                    // We had prefix + hash + '-' but no package character.
+                    // That's not a real store path; bail.
+                    self.bail(b, out);
+                }
+            }
+            State::Pkg { count } => {
+                if is_pkg_char(b) {
+                    self.buffer.push(b);
+                    self.state = State::Pkg { count: count + 1 };
+                } else {
+                    // Package terminator. The candidate is a valid store
+                    // path; commit, then re-process the terminator byte from
+                    // a clean Idle state (so e.g. a `/` after the pkg can
+                    // start a new match... it won't here, but in general
+                    // bytes after pkg may resume scanning).
+                    self.commit(out);
+                    self.step(b, out);
+                }
+            }
+        }
+    }
+
+    /// Match failed: emit the in-flight candidate verbatim, reset, and
+    /// re-process the byte that caused the bail in case it itself starts a
+    /// new candidate (e.g. a stray `/` after a half-matched `/nix/store/`).
+    fn bail(&mut self, b: u8, out: &mut Vec<u8>) {
+        if !self.buffer.is_empty() {
+            out.extend_from_slice(&self.buffer);
+            self.buffer.clear();
+        }
+        self.state = State::Idle;
+        // Re-process b in Idle. Bounded recursion: Idle either emits b
+        // directly or transitions to Prefix; in neither path does it call
+        // bail again, so there is no possibility of unbounded recursion.
+        self.step(b, out);
+    }
+
+    /// Match succeeded: emit `REPLACEMENT`, reset.
+    fn commit(&mut self, out: &mut Vec<u8>) {
+        out.extend_from_slice(REPLACEMENT);
+        self.buffer.clear();
+        self.state = State::Idle;
+    }
+}
+
+/// Hash characters: digits and lowercase letters. Nix uses a 32-char subset
+/// of base-32 (no `e`, `o`, `t`, `u`) but we accept the full lowercase
+/// alphabet for robustness; over-matching at this layer would mean failing
+/// the dash check later, which still bails cleanly.
+#[inline]
+fn is_hash_char(b: u8) -> bool {
+    b.is_ascii_digit() || b.is_ascii_lowercase()
+}
+
+/// Package-name characters. Matches the practical alphabet used by every
+/// derivation in nixpkgs: letters, digits, dot, dash, underscore, plus.
+#[inline]
+fn is_pkg_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'+')
 }
 
 /// Pump bytes from `reader` through a [`PathRewriter`] into `writer` until
@@ -168,25 +315,68 @@ mod tests {
 
     // ----- helpers -------------------------------------------------------
 
-    /// Reference implementation used as the oracle: a naive byte-level
-    /// find-and-replace that operates entirely on `&[u8]` and therefore does
-    /// not corrupt non-UTF-8 bytes. Equivalent in behaviour to the streaming
-    /// rewriter but trivially correct.
+    /// A representative 32-character hash made of lowercase letters and
+    /// digits, used in most of the positive examples below.
+    const HASH32: &[u8] = b"3p5l9d7v3w7nq2x9jk8m5a7s8b1234567";
+
+    /// A representative store path. Note this is exactly what the user's
+    /// example uses; the rewriter must collapse it to `nix:/bin/ls`.
+    fn example_path() -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"/nix/store/");
+        v.extend_from_slice(HASH32);
+        v.extend_from_slice(b"-coreutils-9.5/bin/ls");
+        v
+    }
+
+    /// Reference implementation used as the oracle: a non-streaming
+    /// equivalent of the rewriter. For each position in `input` it tries to
+    /// match a full store path; on success it emits `nix:` and skips past
+    /// the matched bytes; otherwise it emits one byte and advances.
     fn oracle(input: &[u8]) -> Vec<u8> {
-        let needle = PathRewriter::pattern();
-        let replacement = PathRewriter::replacement();
         let mut out = Vec::with_capacity(input.len());
         let mut i = 0;
         while i < input.len() {
-            if input[i..].starts_with(needle) {
-                out.extend_from_slice(replacement);
-                i += needle.len();
+            if let Some(consumed) = try_match_at(&input[i..]) {
+                out.extend_from_slice(PathRewriter::replacement());
+                i += consumed;
             } else {
                 out.push(input[i]);
                 i += 1;
             }
         }
         out
+    }
+
+    /// Returns the number of bytes consumed if `s` starts with a full store
+    /// path according to the documented grammar; otherwise `None`.
+    fn try_match_at(s: &[u8]) -> Option<usize> {
+        if !s.starts_with(PREFIX) {
+            return None;
+        }
+        let mut i = PREFIX.len();
+        // Hash: greedy, must be at least MIN_HASH_LEN.
+        let hash_start = i;
+        while i < s.len() && is_hash_char(s[i]) {
+            i += 1;
+        }
+        if i - hash_start < MIN_HASH_LEN {
+            return None;
+        }
+        // Dash.
+        if i >= s.len() || s[i] != b'-' {
+            return None;
+        }
+        i += 1;
+        // Package: at least one pkg char.
+        let pkg_start = i;
+        while i < s.len() && is_pkg_char(s[i]) {
+            i += 1;
+        }
+        if i == pkg_start {
+            return None;
+        }
+        Some(i)
     }
 
     /// Feed `input` through the rewriter using the given split points and
@@ -205,12 +395,22 @@ mod tests {
         out
     }
 
+    // ----- the headline example -----------------------------------------
+
+    #[test]
+    fn user_example_collapses_to_nix_colon_bin_ls() {
+        // This is the exact example from the requirements doc; if anything
+        // ever drifts in the rewriter, this test is the canary.
+        let input = example_path();
+        assert_eq!(PathRewriter::rewrite_all(&input), b"nix:/bin/ls");
+    }
+
     // ----- basic behaviour ----------------------------------------------
 
     #[test]
     fn pattern_and_replacement_are_what_we_advertise() {
-        assert_eq!(PathRewriter::pattern(), b"/nix/store");
-        assert_eq!(PathRewriter::replacement(), b"[nix-store]");
+        assert_eq!(PathRewriter::pattern(), b"/nix/store/");
+        assert_eq!(PathRewriter::replacement(), b"nix:");
     }
 
     #[test]
@@ -223,10 +423,11 @@ mod tests {
     fn input_without_pattern_passes_through_unchanged() {
         let cases: &[&[u8]] = &[
             b"hello world",
-            b"\x1b[31mcolor\x1b[0m",         // ANSI escape sequence
+            b"\x1b[31mcolor\x1b[0m",
             b"/usr/local/bin/foo",
-            b"/nix",                          // proper prefix only, no follow-up
-            b"/nix/stor",                     // proper prefix only
+            b"/nix",
+            b"/nix/stor",
+            b"/nix/store",            // missing the trailing slash
             "raksmorgas".as_bytes(),
         ];
         for c in cases {
@@ -235,57 +436,94 @@ mod tests {
     }
 
     #[test]
-    fn single_match_is_rewritten() {
+    fn single_match_followed_by_path() {
+        let mut input = Vec::new();
+        input.extend_from_slice(b"/nix/store/");
+        input.extend_from_slice(HASH32);
+        input.extend_from_slice(b"-coreutils-9.5/bin/ls");
         assert_eq!(
-            PathRewriter::rewrite_all(b"/nix/store/abc-pkg/bin/foo"),
-            b"[nix-store]/abc-pkg/bin/foo"
+            PathRewriter::rewrite_all(&input),
+            b"nix:/bin/ls"
         );
     }
 
     #[test]
-    fn match_at_start_middle_and_end() {
+    fn single_match_with_no_trailing_path() {
+        // Store path at end of input with no `/<rest>` after the pkg name.
+        let mut input = Vec::new();
+        input.extend_from_slice(b"/nix/store/");
+        input.extend_from_slice(HASH32);
+        input.extend_from_slice(b"-coreutils-9.5");
+        assert_eq!(PathRewriter::rewrite_all(&input), b"nix:");
+    }
+
+    #[test]
+    fn match_at_start_middle_and_end_of_line() {
+        let mut input = Vec::new();
+        input.extend_from_slice(b"see /nix/store/");
+        input.extend_from_slice(HASH32);
+        input.extend_from_slice(b"-coreutils-9.5/bin/ls for details");
         assert_eq!(
-            PathRewriter::rewrite_all(b"/nix/store at start"),
-            b"[nix-store] at start"
-        );
-        assert_eq!(
-            PathRewriter::rewrite_all(b"hello /nix/store middle"),
-            b"hello [nix-store] middle"
-        );
-        assert_eq!(
-            PathRewriter::rewrite_all(b"trailing /nix/store"),
-            b"trailing [nix-store]"
+            PathRewriter::rewrite_all(&input),
+            b"see nix:/bin/ls for details"
         );
     }
 
     #[test]
     fn multiple_matches_in_one_chunk() {
-        let input = b"/nix/store/a /nix/store/b /nix/store/c";
-        let want  = b"[nix-store]/a [nix-store]/b [nix-store]/c";
-        assert_eq!(PathRewriter::rewrite_all(input), want);
+        let mut input = Vec::new();
+        input.extend_from_slice(b"/nix/store/");
+        input.extend_from_slice(HASH32);
+        input.extend_from_slice(b"-pkg-1/bin and /nix/store/");
+        input.extend_from_slice(HASH32);
+        input.extend_from_slice(b"-pkg-2/bin");
+        assert_eq!(
+            PathRewriter::rewrite_all(&input),
+            b"nix:/bin and nix:/bin"
+        );
     }
 
     #[test]
-    fn adjacent_matches_are_rewritten() {
-        // The contract is "every literal occurrence", including back-to-back.
-        let input = b"/nix/store/nix/store";
-        // First match consumes "/nix/store", emitting "[nix-store]".
-        // Then the remaining "/nix/store" matches and is rewritten too.
-        let want = b"[nix-store][nix-store]";
-        assert_eq!(PathRewriter::rewrite_all(input), want);
+    fn pkg_with_dashes_dots_pluses_underscores() {
+        // Real-world-ish pkg names mix dots, pluses, dashes, underscores.
+        let mut input = Vec::new();
+        input.extend_from_slice(b"/nix/store/");
+        input.extend_from_slice(HASH32);
+        input.extend_from_slice(b"-gtk+3-3.24.42_dev/lib");
+        assert_eq!(PathRewriter::rewrite_all(&input), b"nix:/lib");
+    }
+
+    #[test]
+    fn hash_longer_than_32_still_matches() {
+        // The grammar accepts >=32 hash chars to tolerate format drift and
+        // to be lenient with user-supplied examples.
+        let long_hash = b"a3p5l9d7v3w7nq2x9jk8m5a7s8b1234567xyz"; // 37 chars
+        let mut input = Vec::new();
+        input.extend_from_slice(b"/nix/store/");
+        input.extend_from_slice(long_hash);
+        input.extend_from_slice(b"-pkg/bin");
+        assert_eq!(PathRewriter::rewrite_all(&input), b"nix:/bin");
     }
 
     #[test]
     fn near_misses_are_left_alone() {
-        // Inputs that look like the pattern but do not actually contain it
-        // as a literal substring must pass through unchanged.
+        let mut short_hash = Vec::new();
+        short_hash.extend_from_slice(b"/nix/store/abc-pkg/bin"); // 3-char hash
+        let mut no_dash = Vec::new();
+        no_dash.extend_from_slice(b"/nix/store/");
+        no_dash.extend_from_slice(HASH32);
+        no_dash.extend_from_slice(b"_pkg/bin"); // underscore instead of dash
+        let mut no_pkg = Vec::new();
+        no_pkg.extend_from_slice(b"/nix/store/");
+        no_pkg.extend_from_slice(HASH32);
+        no_pkg.extend_from_slice(b"-/foo"); // dash then immediate slash, no pkg char
         let cases: &[(&[u8], &[u8])] = &[
-            (b"/nix/storage",     b"/nix/storage"),    // 10th byte differs ('a' vs 'e')
-            (b"/Nix/Store",       b"/Nix/Store"),      // case-sensitive
-            (b"//nix/store",      b"/[nix-store]"),    // junk slash then real match
-            (b"nix/store",        b"nix/store"),       // missing leading slash
-            (b"/nix/sto",         b"/nix/sto"),        // proper prefix only
-            (b"/nix/stor",        b"/nix/stor"),       // proper prefix only
+            (b"/nix/storage/foo",       b"/nix/storage/foo"),    // 'a' is not '/'
+            (b"/Nix/Store/abc",         b"/Nix/Store/abc"),      // case-sensitive
+            (&short_hash,               &short_hash),            // hash too short
+            (&no_dash,                  &no_dash),               // wrong separator
+            (&no_pkg,                   &no_pkg),                // empty pkg
+            (b"nix/store/whatever",     b"nix/store/whatever"),  // missing leading /
         ];
         for (input, want) in cases {
             assert_eq!(
@@ -297,53 +535,33 @@ mod tests {
         }
     }
 
-    #[test]
-    fn pattern_followed_by_trailing_char_still_matches() {
-        // /nix/storey contains /nix/store as a literal prefix, so the
-        // pattern must be rewritten and the trailing 'y' kept.
-        assert_eq!(
-            PathRewriter::rewrite_all(b"/nix/storey"),
-            b"[nix-store]y"
-        );
-    }
-
     // ----- chunk boundary tests -----------------------------------------
 
     #[test]
-    fn split_inside_pattern_still_rewrites_correctly() {
-        let input: &[u8] = b"prefix /nix/store/pkg suffix";
-        let want = oracle(input);
+    fn every_split_point_produces_the_same_output() {
+        // Mix of a real match, leading junk, trailing junk, and a near-miss
+        // to exercise both commit and bail paths under chunking.
+        let mut input = Vec::new();
+        input.extend_from_slice(b"prefix /nix/storage/x ");
+        input.extend_from_slice(b"/nix/store/");
+        input.extend_from_slice(HASH32);
+        input.extend_from_slice(b"-pkg-1.0/bin/ls suffix");
+        let want = oracle(&input);
 
-        // Try every possible split point.
         for split in 0..=input.len() {
-            let got = feed_with_splits(input, &[split]);
+            let got = feed_with_splits(&input, &[split]);
             assert_eq!(got, want, "split at byte {}", split);
         }
     }
 
     #[test]
-    fn pattern_split_across_three_chunks() {
-        // Split the literal pattern itself across three reads.
-        let input: &[u8] = b"foo/nix/store/bar";
-        let want = oracle(input);
-        for a in 0..=input.len() {
-            for b in a..=input.len() {
-                let got = feed_with_splits(input, &[a, b]);
-                assert_eq!(got, want, "splits at {}, {}", a, b);
-            }
-        }
-    }
-
-    #[test]
-    fn many_one_byte_chunks() {
-        // Feed one byte at a time. The state machine must still match the
-        // pattern across chunk boundaries.
-        let input: &[u8] = b"x /nix/store/y /nix/store/z";
-        let want = oracle(input);
+    fn one_byte_at_a_time_matches_one_shot() {
+        let input = example_path();
+        let want = PathRewriter::rewrite_all(&input);
 
         let mut r = PathRewriter::new();
         let mut out = Vec::new();
-        for &b in input {
+        for &b in &input {
             r.process(&[b], &mut out);
         }
         r.flush(&mut out);
@@ -351,20 +569,36 @@ mod tests {
     }
 
     #[test]
-    fn flush_emits_held_back_proper_prefix() {
-        // Stream ends mid-pattern. Held-back bytes must be flushed verbatim,
-        // not silently dropped.
+    fn flush_emits_buffered_candidate_when_stream_ends_mid_match() {
+        // Stream ends in the middle of the hash. Buffered bytes must be
+        // emitted verbatim, not silently dropped.
         let mut r = PathRewriter::new();
         let mut out = Vec::new();
-        r.process(b"hello /nix/sto", &mut out);
-        // At this point "/nix/sto" should be held back.
-        assert_eq!(out, b"hello ");
+        r.process(b"hello /nix/store/abcdef", &mut out);
+        assert_eq!(out, b"hello "); // partial candidate is held back
         r.flush(&mut out);
-        assert_eq!(out, b"hello /nix/sto");
+        assert_eq!(out, b"hello /nix/store/abcdef");
     }
 
     #[test]
-    fn flush_clears_pending_so_rewriter_can_be_reused() {
+    fn flush_commits_when_stream_ends_with_complete_pkg() {
+        // Stream ends right after the pkg name, with no trailing path.
+        let mut input = Vec::new();
+        input.extend_from_slice(b"/nix/store/");
+        input.extend_from_slice(HASH32);
+        input.extend_from_slice(b"-pkg-1.0");
+
+        let mut r = PathRewriter::new();
+        let mut out = Vec::new();
+        r.process(&input, &mut out);
+        // Nothing emitted yet: still in Pkg state waiting for terminator.
+        assert!(out.is_empty());
+        r.flush(&mut out);
+        assert_eq!(out, b"nix:");
+    }
+
+    #[test]
+    fn rewriter_can_be_reused_after_flush() {
         let mut r = PathRewriter::new();
         let mut out = Vec::new();
         r.process(b"/nix/sto", &mut out);
@@ -372,48 +606,86 @@ mod tests {
         assert_eq!(out, b"/nix/sto");
 
         out.clear();
-        r.process(b"/nix/store/", &mut out);
+        let mut input = Vec::new();
+        input.extend_from_slice(b"/nix/store/");
+        input.extend_from_slice(HASH32);
+        input.extend_from_slice(b"-pkg/bin");
+        r.process(&input, &mut out);
         r.flush(&mut out);
-        assert_eq!(out, b"[nix-store]/");
+        assert_eq!(out, b"nix:/bin");
     }
+
+    // ----- safety / bounds ----------------------------------------------
 
     #[test]
-    fn pending_buffer_is_bounded() {
-        // Even in the worst case, the held-back tail must never exceed
-        // PATTERN.len() - 1 bytes. We assert that by inspection after
-        // feeding inputs that try to maximise the tail.
+    fn candidate_buffer_is_bounded() {
+        // Pathological input: an unbounded stream of hash chars after the
+        // prefix. The buffer must not grow without limit; once we exceed
+        // MAX_CANDIDATE_LEN the rewriter bails.
+        let mut input = Vec::new();
+        input.extend_from_slice(b"/nix/store/");
+        input.extend(std::iter::repeat(b'a').take(MAX_CANDIDATE_LEN * 2));
+
+        let mut r = PathRewriter::new();
         let mut out = Vec::new();
-        for chunk in [
-            &b"/"[..], &b"/n"[..], &b"/ni"[..], &b"/nix"[..], &b"/nix/"[..],
-            &b"/nix/s"[..], &b"/nix/st"[..], &b"/nix/sto"[..], &b"/nix/stor"[..],
-        ] {
-            let mut r = PathRewriter::new();
-            out.clear();
-            r.process(chunk, &mut out);
-            assert!(
-                r.pending.len() < PATTERN.len(),
-                "pending grew to {} bytes for input {:?}",
-                r.pending.len(),
-                chunk
-            );
-        }
+        r.process(&input, &mut out);
+        // Internal buffer must stay bounded by MAX_CANDIDATE_LEN.
+        assert!(
+            r.buffer.len() <= MAX_CANDIDATE_LEN,
+            "buffer grew to {}",
+            r.buffer.len()
+        );
+        r.flush(&mut out);
+        // And the bail path must have emitted all input verbatim.
+        assert_eq!(out, input);
     }
 
-    // ----- mixed content tests ------------------------------------------
+    // ----- mixed content -------------------------------------------------
 
     #[test]
     fn preserves_ansi_color_sequences_around_match() {
-        let input = b"\x1b[32m/nix/store/abc\x1b[0m";
-        let want  = b"\x1b[32m[nix-store]/abc\x1b[0m";
-        assert_eq!(PathRewriter::rewrite_all(input), want);
+        let mut input = Vec::new();
+        input.extend_from_slice(b"\x1b[32m");
+        input.extend_from_slice(b"/nix/store/");
+        input.extend_from_slice(HASH32);
+        input.extend_from_slice(b"-pkg-1/bin");
+        input.extend_from_slice(b"\x1b[0m\n");
+        assert_eq!(
+            PathRewriter::rewrite_all(&input),
+            b"\x1b[32mnix:/bin\x1b[0m\n"
+        );
+    }
+
+    #[test]
+    fn ansi_escape_inside_pkg_terminates_match_safely() {
+        // If an ANSI escape lands in the middle of what looks like a pkg
+        // name, the partial pkg counts (it's >= 1 char) and we commit.
+        // The escape sequence and the rest pass through verbatim.
+        let mut input = Vec::new();
+        input.extend_from_slice(b"/nix/store/");
+        input.extend_from_slice(HASH32);
+        input.extend_from_slice(b"-pkg\x1b[0mtail");
+        assert_eq!(
+            PathRewriter::rewrite_all(&input),
+            b"nix:\x1b[0mtail"
+        );
     }
 
     #[test]
     fn preserves_utf8_multibyte_around_match() {
-        // Non-ASCII multibyte (UTF-8) bytes must pass through untouched.
-        let input = "smörgås /nix/store/krydda".as_bytes();
-        let want = "smörgås [nix-store]/krydda".as_bytes();
-        assert_eq!(PathRewriter::rewrite_all(input), want);
+        let mut input = Vec::new();
+        input.extend_from_slice("smörgås ".as_bytes());
+        input.extend_from_slice(b"/nix/store/");
+        input.extend_from_slice(HASH32);
+        input.extend_from_slice(b"-pkg/bin");
+        input.extend_from_slice(" krydda".as_bytes());
+
+        let mut want = Vec::new();
+        want.extend_from_slice("smörgås ".as_bytes());
+        want.extend_from_slice(b"nix:/bin");
+        want.extend_from_slice(" krydda".as_bytes());
+
+        assert_eq!(PathRewriter::rewrite_all(&input), want);
     }
 
     #[test]
@@ -422,6 +694,8 @@ mod tests {
         for b in 0u8..=255 {
             payload.push(b);
         }
+        // Note: this payload happens not to contain `/nix/store/` as a
+        // substring (255 unique bytes can't), so it is unchanged.
         assert_eq!(PathRewriter::rewrite_all(&payload), payload);
     }
 
@@ -429,16 +703,14 @@ mod tests {
 
     #[test]
     fn random_payload_round_trips_through_oracle() {
-        // Deterministic pseudo-random data with sprinkled-in patterns.
-        let mut data = Vec::with_capacity(10_000);
+        let mut data: Vec<u8> = Vec::with_capacity(10_000);
         let mut state: u32 = 0x1234_5678;
         for i in 0..10_000 {
-            // xorshift32
             state ^= state << 13;
             state ^= state >> 17;
             state ^= state << 5;
-            // Bias towards printable ASCII so the test output is readable
-            // when something fails, but keep some non-ASCII bytes too.
+            // Bias towards printable ASCII so failures are readable, but
+            // keep some non-ASCII bytes too.
             let byte = if state & 0xff < 200 {
                 (32u8 + (state & 0x5f) as u8).min(126)
             } else {
@@ -446,19 +718,26 @@ mod tests {
             };
             data.push(byte);
             if i % 137 == 0 {
+                // Embed a real store path.
                 data.extend_from_slice(b"/nix/store/");
+                data.extend_from_slice(HASH32);
+                data.extend_from_slice(b"-coreutils-9.5/bin/ls ");
             }
             if i % 211 == 0 {
-                data.extend_from_slice(b"/nix/stor");          // proper prefix
+                data.extend_from_slice(b"/nix/stor"); // proper prefix only
             }
             if i % 311 == 0 {
-                data.extend_from_slice(b"/nix/storage");       // near miss
+                data.extend_from_slice(b"/nix/storage/x"); // near miss
+            }
+            if i % 419 == 0 {
+                // Almost a store path but with a too-short hash.
+                data.extend_from_slice(b"/nix/store/abc-pkg/bin");
             }
         }
         let want = oracle(&data);
         assert_eq!(PathRewriter::rewrite_all(&data), want);
 
-        // Now also feed it in pseudo-random chunks and verify the same output.
+        // Same payload, but fed in pseudo-random chunks.
         let mut r = PathRewriter::new();
         let mut out = Vec::new();
         let mut i = 0;
@@ -466,7 +745,7 @@ mod tests {
             state ^= state << 13;
             state ^= state >> 17;
             state ^= state << 5;
-            let take = ((state % 17) as usize + 1).min(data.len() - i);
+            let take = ((state % 23) as usize + 1).min(data.len() - i);
             r.process(&data[i..i + take], &mut out);
             i += take;
         }
@@ -478,11 +757,16 @@ mod tests {
 
     #[test]
     fn pipe_through_basic() {
-        let input = b"/nix/store/abc and /nix/store/def";
+        let mut input = Vec::new();
+        input.extend_from_slice(b"/nix/store/");
+        input.extend_from_slice(HASH32);
+        input.extend_from_slice(b"-a/x and /nix/store/");
+        input.extend_from_slice(HASH32);
+        input.extend_from_slice(b"-b/y");
         let mut out: Vec<u8> = Vec::new();
-        let n = pipe_through(Cursor::new(input), &mut out).unwrap();
+        let n = pipe_through(Cursor::new(&input), &mut out).unwrap();
         assert_eq!(n as usize, input.len());
-        assert_eq!(out, b"[nix-store]/abc and [nix-store]/def");
+        assert_eq!(out, b"nix:/x and nix:/y");
     }
 
     #[test]
@@ -494,17 +778,24 @@ mod tests {
     }
 
     #[test]
-    fn pipe_through_flushes_trailing_proper_prefix() {
-        // The Cursor will deliver one chunk; the rewriter must still flush
-        // its pending tail at EOF.
+    fn pipe_through_flushes_trailing_buffered_candidate() {
         let mut out: Vec<u8> = Vec::new();
         pipe_through(Cursor::new(b"trailing /nix/sto"), &mut out).unwrap();
         assert_eq!(out, b"trailing /nix/sto");
     }
 
-    /// A `Read` adapter that returns its input in fixed-size chunks. Used to
-    /// prove that `pipe_through` behaves correctly under realistic, small
-    /// PTY reads.
+    #[test]
+    fn pipe_through_commits_when_stream_ends_with_complete_pkg() {
+        let mut input = Vec::new();
+        input.extend_from_slice(b"/nix/store/");
+        input.extend_from_slice(HASH32);
+        input.extend_from_slice(b"-pkg");
+        let mut out: Vec<u8> = Vec::new();
+        pipe_through(Cursor::new(&input), &mut out).unwrap();
+        assert_eq!(out, b"nix:");
+    }
+
+    /// A `Read` adapter that returns its input in fixed-size chunks.
     struct Chunked<'a> {
         data: &'a [u8],
         chunk: usize,
@@ -523,13 +814,21 @@ mod tests {
 
     #[test]
     fn pipe_through_handles_small_chunks() {
-        let input: &[u8] = b"a /nix/store/x b /nix/store/y c";
+        let input = example_path();
+        let want = PathRewriter::rewrite_all(&input);
         for chunk in 1..=input.len() {
             let mut out: Vec<u8> = Vec::new();
-            pipe_through(Chunked { data: input, chunk }, &mut out).unwrap();
+            pipe_through(
+                Chunked {
+                    data: &input,
+                    chunk,
+                },
+                &mut out,
+            )
+            .unwrap();
             assert_eq!(
                 out,
-                oracle(input),
+                want,
                 "chunk size {} produced wrong output",
                 chunk
             );
@@ -537,7 +836,6 @@ mod tests {
     }
 
     /// A `Read` that returns `Interrupted` once then the real data.
-    /// Verifies the loop's EINTR handling.
     struct Interrupting<'a> {
         data: &'a [u8],
         emitted: bool,
@@ -564,20 +862,24 @@ mod tests {
 
     #[test]
     fn pipe_through_retries_on_interrupted() {
+        let mut input = Vec::new();
+        input.extend_from_slice(b"hi /nix/store/");
+        input.extend_from_slice(HASH32);
+        input.extend_from_slice(b"-x/bin");
         let mut out: Vec<u8> = Vec::new();
         pipe_through(
             Interrupting {
-                data: b"hi /nix/store/x",
+                data: &input,
                 emitted: false,
                 done: false,
             },
             &mut out,
         )
         .unwrap();
-        assert_eq!(out, b"hi [nix-store]/x");
+        assert_eq!(out, b"hi nix:/bin");
     }
 
-    /// A `Write` that always errors. Used to confirm I/O errors are propagated.
+    /// A `Write` that always errors. Confirms I/O errors are propagated.
     struct AlwaysFails;
     impl Write for AlwaysFails {
         fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
@@ -590,7 +892,11 @@ mod tests {
 
     #[test]
     fn pipe_through_propagates_write_errors() {
-        let err = pipe_through(Cursor::new(b"/nix/store/x"), AlwaysFails).unwrap_err();
+        let mut input = Vec::new();
+        input.extend_from_slice(b"/nix/store/");
+        input.extend_from_slice(HASH32);
+        input.extend_from_slice(b"-x/bin");
+        let err = pipe_through(Cursor::new(&input), AlwaysFails).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     }
 }
