@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Document version | 1.1.0 |
+| Document version | 1.1.1 |
 | Last updated | 2026-05-21 |
 | Status | Draft |
 | Applies to | `nix-pretty` v0.1.0 (crate `nix-pretty`, repository `terminal-wrapper-for-nix`) |
@@ -267,9 +267,10 @@ to be installed setuid.
   and §1.3 (we explicitly do not filter). The wrapper does not increase
   this risk: a user running the same program without the wrapper sees
   the same escapes.
-* **Recommendation.** Document the policy explicitly in the README under
-  a "Security considerations" heading so downstream consumers do not
-  mistake `nix-pretty` for a sanitiser.
+* **Recommendation.** Implemented in v1.1.1: README.md has a "Security
+  considerations" section that states explicitly that the wrapper is not a
+  sanitiser. Downstream consumers reading the README cannot mistake
+  `nix-pretty` for a defence against CWE-150.
 
 ### 4.4 TIOCSTI input injection from the child
 
@@ -502,6 +503,8 @@ Ordered by cost / benefit.
    "Security considerations" section that states the wrapper does not
    sanitise terminal escapes. Cost: minutes. Benefit: prevents
    downstream consumers from treating the wrapper as a sanitiser.
+   *Status: implemented in v1.1.1 (see README.md "Security
+   considerations").*
 2. **Install a panic hook that restores termios.** Eliminates the
    `panic = "abort"` discrepancy in §4.6. Cost: ~20 lines of code.
    Benefit: usability and matches the architecture document's claim.
@@ -576,3 +579,4 @@ the PoC.
 | --- | --- | --- |
 | 1.0.0 | 2026-05-21 | Initial Security Architecture Document. |
 | 1.1.0 | 2026-05-21 | Added §4 attack-vector summary table with privilege-escalation note. Added versioning metadata at the top of the document. |
+| 1.1.1 | 2026-05-21 | Marked §6.1 as implemented: ANSI pass-through policy documented in README.md "Security considerations". Updated §4.3 recommendation accordingly. |

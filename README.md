@@ -124,6 +124,33 @@ The guard variable `NIX_PRETTY_ACTIVE` prevents an infinite re-exec loop. The
   many short-lived shells (for example through `xargs bash -c ...`), wrap the
   outermost shell rather than each child.
 
+## Security considerations
+
+`nix-pretty` is a **byte-stream rewriter, not a sanitiser**. It is deliberately
+transparent to everything except the `/nix/store/<hash>-<pkg>` grammar:
+
+* ANSI / CSI colour and cursor escape sequences pass through unchanged.
+* OSC sequences (terminal title, hyperlinks, clipboard on emulators that
+  support OSC 52) pass through unchanged.
+* DCS and APC sequences pass through unchanged.
+* UTF-8 and arbitrary binary bytes pass through unchanged.
+
+The wrapper therefore does **not** protect against terminal-escape injection
+attacks (CWE-150, CVE-2025-58160, CVE-2025-55193, CVE-2025-55754 and similar)
+in output produced by the wrapped shell or programs it runs. A user running
+the same program *without* `nix-pretty` would see the exact same escape bytes
+on their terminal, so the wrapper does not add new risk — but it also does
+not remove the existing risk.
+
+If you need to view untrusted output (CI logs, build output of unknown
+derivations, hostile files) safely, run that program outside `nix-pretty`
+in a dedicated terminal emulator with escape filtering, or pipe it through
+a tool that strips control sequences first.
+
+The remaining security properties (PTY isolation of the child, bounded
+buffers, `setsid` + `TIOCSCTTY` to defeat `TIOCSTI` push-back) are
+documented in detail in [SECURITY.md](SECURITY.md).
+
 ## Development
 
 ```
