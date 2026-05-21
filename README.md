@@ -55,6 +55,55 @@ If you would rather use your system Rust toolchain, `cargo build --release`
 works equally well outside `nix-shell`. The only build dependencies are the
 crates listed in `Cargo.toml`; there is no C build step.
 
+### Local builds with `./build.sh`
+
+For day-to-day use - building a fresh binary and dropping it on your `PATH` -
+the repo ships a small helper at `./build.sh`. The first time, mark it
+executable:
+
+```
+chmod +x build.sh
+```
+
+After that, a normal cycle is one command:
+
+```
+./build.sh
+```
+
+That:
+
+1. Re-execs itself inside `nix-shell` if `shell.nix` is present and you are
+   not already inside one, so the pinned Rust toolchain is used.
+2. Bumps the **patch** version in `Cargo.toml` (`--minor` / `--major` /
+   `--no-bump` are available too).
+3. Runs `cargo build --release`.
+4. Commits **only** `Cargo.toml` and `Cargo.lock` with the message
+   `chore(release): local build vX.Y.Z`. Anything else in your worktree is
+   left untouched.
+5. Installs the resulting `target/release/nix-pretty` to `/usr/local/bin`
+   on both macOS and Linux. That path is in the default `PATH` on both
+   OSes and makes no assumption about Homebrew, MacPorts or any other
+   package manager being present. The script uses `sudo` for the final
+   copy step only when the destination is not writable.
+
+The script **never** creates a git tag and **never** pushes. Tagging is
+reserved for official releases that go through a separate, human-driven
+workflow.
+
+Common variations:
+
+```
+./build.sh --minor                  # 0.1.4 -> 0.2.0 instead of 0.1.5
+./build.sh --no-bump --no-commit    # just rebuild & reinstall current source
+./build.sh --prefix "$HOME/.local/bin"
+./build.sh --no-install             # build only, do not touch /usr/local/bin
+./build.sh --no-nix-shell           # use whatever cargo is already in PATH
+./build.sh --help                   # full flag list
+```
+
+`PREFIX=/some/dir ./build.sh` is equivalent to `./build.sh --prefix /some/dir`.
+
 ## Using it
 
 ### As an explicit command
