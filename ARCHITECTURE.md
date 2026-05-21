@@ -206,6 +206,40 @@ no colours, no prompt redrawing, no readline, no full-screen TUIs. The
 result is a wrapper that nobody wants to use. We accept the extra complexity
 of a real PTY because it is the difference between "useful" and "not".
 
+### Single PTY: input echo and stderr ride on the output stream
+
+A consequence of the single-PTY design that is worth stating explicitly,
+because it surprises new readers: the only stream the rewriter ever sees
+is "bytes coming out of the PTY master." That stream multiplexes three
+logically different things that the child process produced independently:
+
+1. The shell's stdout (`fd 1`).
+2. The shell's stderr (`fd 2`). In `child_after_fork` we `dup2` the slave
+   onto both `fd 1` and `fd 2`, so once the shell has run a single
+   `write(2, ...)` the bytes are indistinguishable from `write(1, ...)`
+   on the master side.
+3. The echo of the user's typed/pasted input. The PTY line discipline
+   (and bash's readline, when it is in charge of echoing) sends typed
+   characters back out through the slave so the user can see what they
+   are typing. From the master fd's point of view those echoed bytes are
+   simply more output.
+
+The wrapper never touches stdin on its way *in* — `spawn_stdin_forwarder`
+copies bytes verbatim to the master. But it cannot tell, on the way *out*,
+whether a given byte originated as program stdout, program stderr, or the
+echo of a keystroke. The rewriter therefore collapses store paths
+uniformly, including in the echo of a paste and in stderr error messages.
+
+The behavioural implications are documented in README.md ("What you see
+vs. what the shell actually receives"). The short version: what `bash`
+*receives* from a paste is always the real, untouched bytes — only what
+the user *sees* echoed back is collapsed. Splitting the three streams
+back apart would mean either a second PTY (unusual and fights with
+`setsid` / `TIOCSCTTY`), a separate pipe for stderr (loses `isatty`-gated
+behaviours like coloured error output), or in-band tagging (requires
+shell cooperation). None of those is worth the cost for the current
+single-display-target use case.
+
 ### State machine versus regex
 
 A regex like `/nix/store/[0-9a-z]{32,}-[A-Za-z0-9._+-]+` expresses the same

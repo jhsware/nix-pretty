@@ -32,6 +32,75 @@ The rewriter operates on raw bytes and is safe for streams that contain ANSI
 colour escapes, UTF-8 text, or partial reads where a store path lands across
 two chunks.
 
+## What you see vs. what the shell actually receives
+
+The rewriter only runs on bytes flowing from the PTY master back to your
+real terminal. Everything else — stdin, internal shell pipelines, captured
+command output, argv, environment variables, on-disk paths — is untouched.
+
+This has two consequences that are worth spelling out, because they look
+surprising at first glance.
+
+### Pasted or typed paths look rewritten on screen
+
+If you paste `/nix/store/<hash>-coreutils-9.5/bin/ls` at the bash prompt,
+what you see on screen is `nix:/bin/ls`. The full path is still what bash
+receives, and pressing Enter will run the real `/bin/ls`. The reason for
+the visual mismatch is how a PTY works:
+
+```
+keypress  ->  real stdin  ->  PTY master  ->  PTY slave  ->  bash
+                                                              |
+                                                              v
+                                                          echo back
+                                                              |
+real stdout  <-  rewriter  <-  PTY master  <-  PTY slave  <---+
+```
+
+`nix-pretty` never rewrites bytes going *into* bash. It only rewrites bytes
+coming *out* of the PTY master. Bash (via readline) and the kernel's line
+discipline echo your typed/pasted characters back through that same master
+fd so you can see what you're typing — and from the rewriter's point of
+view those echoed bytes are output, indistinguishable from anything else
+the shell printed. So they get collapsed the same way a build log would.
+
+The actual command bash executes is fine. Only the visual echo is collapsed.
+
+### stderr is rewritten too
+
+A child started under `nix-pretty` has fd 1 and fd 2 both `dup2`'d to the
+same slave PTY (see `src/pty.rs`, `child_after_fork`). After that, stdout
+and stderr are multiplexed onto a single byte stream on the master side,
+with no marker telling them apart. The rewriter therefore sees a merged
+stream and collapses store paths in both.
+
+The grammar is strict (`/nix/store/<32+-char-hash>-<pkg>`), so error
+messages that don't contain a literal store path are unaffected. Only the
+path text itself collapses; everything around it — file names, line
+numbers, the actual error description — passes through verbatim.
+
+If you need the original, uncollapsed stderr for a single command, run that
+command outside `nix-pretty` (e.g. by exiting the wrapped shell and
+re-running it from your normal shell, or by piping through `cat` from a
+non-wrapped terminal).
+
+### Scripts passing paths around are unaffected
+
+The rewriter is purely a display-side transform. Anything that stays inside
+the shell process never goes near it:
+
+* `path=$(nix-build .)` captures the real store path into `$path`.
+* `nix-build . | grep something` pipes real bytes between processes; the
+  rewriter never sees the pipe.
+* `cp "$path/bin/foo" ./bar` passes the real path as argv to `cp`.
+* Files on disk, exported env vars, scripted `read`/`exec` invocations —
+  all use the original paths.
+
+The only place a path is collapsed is the byte stream printed to your
+terminal. If a script then tries to *read its own terminal output back* to
+recover a path it just printed, that won't work — but no real script does
+that; scripts use variables.
+
 ## Requirements
 
 A Unix-like system with a working PTY (macOS or Linux). Nix is not required at
